@@ -9,9 +9,12 @@
     "lint": "eslint"
   },
   "dependencies": {
+    "ccxt": "^4.5.48",
     "next": "16.2.3",
+    "protobufjs": "^8.0.1",
     "react": "19.2.4",
-    "react-dom": "19.2.4"
+    "react-dom": "19.2.4",
+    "technicalindicators": "^3.1.0"
   },
   "devDependencies": {
     "@tailwindcss/postcss": "^4",
