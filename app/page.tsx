@@ -1,350 +1,397 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
-import { KST, EMA, StochasticRSI, sma, sd, atr } from "technicalindicators";
+import { EMA, adx, rsi, atr, sma } from "technicalindicators";
+import { unstable_rethrow } from "next/navigation";
+import AutoRefresh from "./_components/auto-refresh";
+import {
+  CANDLE_CACHE_GRACE_MS,
+  MIN_VOLUME,
+  type PairData,
+  RateLimitedError,
+  formatPrice,
+  getFilteredPairs,
+  getKlines,
+  isNearWeightCap,
+  isPastWeightSoftCap,
+  isThrottled,
+  klinesNeedNetwork,
+  sleep,
+  weightCooldownMs,
+} from "./_lib/binance";
 
-const MAX_CONCURRENT = 12;
-const MIN_VOLUME = 1_000_000; // USDT
-const MIN_CHANGE_PERCENT = 3;
+// Entry timeframe: VWAP cross, DMI/ADX, RSI, RVOL and ATR all read from here.
+const ENTRY_INTERVAL = "5m";
+// 500 = weight 2 on fapi klines (101–500 bucket) and ~41h of 5m candles,
+// which always reaches back past the last UTC midnight for the VWAP anchor.
+const ENTRY_KLINE_LIMIT = 500;
 
-interface Ticker {
+// Trend timeframe: EMA50 is read from the 1H chart, not the 5m one.
+const TREND_INTERVAL = "1h";
+const TREND_KLINE_LIMIT = 200; // ~4x EMA50 period so the average is settled
+
+const EMA_PERIOD = 50; // 1H trend, shown for context only — not a gate
+const ADX_PERIOD = 14;
+const MIN_ADX = 18; // DMI trend strength gate
+const RSI_PERIOD = 14;
+const RSI_LONG_MAX = 70; // 1H RSI must be below this for a LONG
+const RSI_SHORT_MIN = 40; // 1H RSI must be above this for a SHORT
+
+const ATR_PERIOD = 14;
+const ATR_MULTIPLIER = 2.0;
+const RISK_REWARD = 1.5;
+
+// VWAP standard-deviation bands: upper/lower = vwap ± N × session stdDev
+const VWAP_BAND_STDDEV = 1;
+
+// Each pair now costs two klines calls (5m + 1h), so keep the burst small.
+const MAX_CONCURRENT = 6;
+
+// ==================== Rate-limit protection ====================
+// Binance fapi allows 2400 request-weight/min per IP, shared across every
+// scanner page (see ./_lib/binance). A fully cold scan here is ~150 eligible
+// pairs x (2 + 2) weight + 41 for exchangeInfo/ticker, i.e. ~640 — so the
+// danger isn't the total, it's bursting and repeated page loads while a scan
+// is already in flight. Defences, in order:
+//   1. each timeframe's klines are cached until that timeframe's candle
+//      actually closes, so refreshing inside a candle costs zero requests and
+//      the 1H series is re-fetched at most once an hour;
+//   2. batches are staggered;
+//   3. the X-MBX-USED-WEIGHT-1M header is read on every response and we idle
+//      when it climbs toward the cap;
+//   4. a 429/418 puts every caller into a cooldown that serves stale cache
+//      instead of hammering the endpoint into an IP ban.
+const ENTRY_CANDLE_MS = 5 * 60_000;
+const TREND_CANDLE_MS = 60 * 60_000;
+const BATCH_DELAY_MS = 120;
+
+interface SignalRow {
   symbol: string;
-  quoteVolume: string;
-  priceChangePercent: string;
-  lastPrice: string;
-  highPrice: string;
-  lowPrice: string;
-}
-
-interface PairData {
-  symbol: string;
-  changePercent: number;
-  volume: number;
-  tickSize: string;
-  lastPrice: number;
-  highPrice: number;
-  lowPrice: number;
-}
-
-interface Signal {
-  symbol: string;
-  strength: number; // KST Gap
-  changePercent: string;
-  kstGap: string;
-  stochK: string;
-  ema50: string;
-  zScore: string;
+  side: "LONG" | "SHORT";
+  strength: number; // ADX, used for sorting
   price: string;
-  side?: "LONG" | "SHORT";
-  stopLoss?: string;
-  takeProfit?: string;
-  volatility: number;
-}
-interface PotentialOpportunity {
-  symbol: string;
-  bias: "BULLISH" | "BEARISH";
-  price: string;
   ema50: string;
-  distancePercent: string;
-  kstGap: string;
-  volatility: string;
+  vwap: string;
+  vwapUpper: string;
+  vwapLower: string;
+  adx: string;
+  plusDI: string;
+  minusDI: string;
+  rsi5m: string;
+  rsi1h: string;
+  volumeRatio: string;
+  atrPercent: string;
   changePercent: string;
+  stopLoss: string;
+  takeProfit: string;
 }
 
-// Helper
-function formatPrice(price: number | string, tickSize: string): string {
-  const ts = parseFloat(tickSize);
-  const decimals = ts >= 1 ? 0 : Math.abs(Math.floor(Math.log10(ts))) || 2;
-  return Number(price).toFixed(decimals);
+// ==================== Helpers ====================
+
+/**
+ * Session VWAP, re-anchored at every UTC midnight — the same line TradingView
+ * draws by default — plus ±N standard-deviation bands computed from the same
+ * cumulative session stats. Returns one value per candle, plus how many
+ * candles deep into the session each one is (a cross is only meaningful once
+ * the session has at least two candles behind it).
+ */
+function sessionVwap(
+  klines: any[],
+  bandStdDev: number,
+): {
+  vwap: number[];
+  upperBand: number[];
+  lowerBand: number[];
+  sessionIndex: number[];
+} {
+  const vwap: number[] = [];
+  const upperBand: number[] = [];
+  const lowerBand: number[] = [];
+  const sessionIndex: number[] = [];
+
+  let cumulativePV = 0;
+  let cumulativePV2 = 0;
+  let cumulativeVolume = 0;
+  let currentDay = -1;
+  let index = 0;
+
+  for (const k of klines) {
+    const openTime = Number(k[0]);
+    const day = Math.floor(openTime / 86_400_000);
+
+    if (day !== currentDay) {
+      currentDay = day;
+      cumulativePV = 0;
+      cumulativePV2 = 0;
+      cumulativeVolume = 0;
+      index = 0;
+    }
+
+    const high = parseFloat(k[2]);
+    const low = parseFloat(k[3]);
+    const close = parseFloat(k[4]);
+    const volume = parseFloat(k[5]);
+    const typicalPrice = (high + low + close) / 3;
+
+    cumulativePV += typicalPrice * volume;
+    cumulativePV2 += typicalPrice * typicalPrice * volume;
+    cumulativeVolume += volume;
+    index += 1;
+
+    const currentVwap =
+      cumulativeVolume > 0 ? cumulativePV / cumulativeVolume : typicalPrice;
+    const variance =
+      cumulativeVolume > 0
+        ? Math.max(cumulativePV2 / cumulativeVolume - currentVwap * currentVwap, 0)
+        : 0;
+    const stdDev = Math.sqrt(variance);
+
+    vwap.push(currentVwap);
+    upperBand.push(currentVwap + bandStdDev * stdDev);
+    lowerBand.push(currentVwap - bandStdDev * stdDev);
+    sessionIndex.push(index);
+  }
+
+  return { vwap, upperBand, lowerBand, sessionIndex };
 }
 
-// Fetch pairs with volume + change filter
-async function getFilteredPairs(): Promise<PairData[]> {
-  const [exchangeRes, tickerRes] = await Promise.all([
-    fetch("https://fapi.binance.com/fapi/v1/exchangeInfo", {
-      cache: "no-store",
-    }),
-    fetch("https://fapi.binance.com/fapi/v1/ticker/24hr", {
-      cache: "no-store",
-    }),
+// ==================== Data Fetching ====================
+
+/** 5m entry series + 1H trend series for one pair. */
+function getPairKlines(symbol: string): Promise<[any[], any[]]> {
+  return Promise.all([
+    getKlines(symbol, ENTRY_INTERVAL, ENTRY_KLINE_LIMIT, ENTRY_CANDLE_MS),
+    getKlines(symbol, TREND_INTERVAL, TREND_KLINE_LIMIT, TREND_CANDLE_MS),
   ]);
-
-  const exchange = await exchangeRes.json();
-  const tickers: Ticker[] = await tickerRes.json();
-
-  const tickerMap = new Map(tickers.map((t) => [t.symbol, t]));
-
-  const precisionMap = new Map<string, string>();
-
-  return exchange.symbols
-    .filter(
-      (s: any) =>
-        s.contractType === "PERPETUAL" &&
-        s.quoteAsset === "USDT" &&
-        s.status === "TRADING",
-    )
-    .map((s: any) => {
-      const priceFilter = s.filters?.find(
-        (f: any) => f.filterType === "PRICE_FILTER",
-      );
-      precisionMap.set(s.symbol, priceFilter?.tickSize ?? "0.01");
-      return s.symbol;
-    })
-    .map((symbol: string) => {
-      const ticker = tickerMap.get(symbol);
-      if (!ticker) return null;
-
-      const volume = parseFloat(ticker.quoteVolume);
-      const change = parseFloat(ticker.priceChangePercent || "0");
-
-      if (volume < MIN_VOLUME || Math.abs(change) < MIN_CHANGE_PERCENT) {
-        return null;
-      }
-
-      return {
-        symbol,
-        changePercent: change,
-        volume,
-        tickSize: precisionMap.get(symbol) || "0.01",
-        lastPrice: parseFloat(ticker.lastPrice),
-        highPrice: parseFloat(ticker.highPrice),
-        lowPrice: parseFloat(ticker.lowPrice),
-      };
-    })
-    .filter(Boolean) as PairData[];
 }
 
-async function getKlines(symbol: string): Promise<any[]> {
-  const res = await fetch(
-    `https://fapi.binance.com/fapi/v1/klines?symbol=${symbol}&interval=1h&limit=200`,
-    { cache: "no-store" },
+/** True when neither timeframe for this pair is still cached. */
+function needsNetwork(symbol: string): boolean {
+  return (
+    klinesNeedNetwork(symbol, ENTRY_INTERVAL, ENTRY_KLINE_LIMIT) ||
+    klinesNeedNetwork(symbol, TREND_INTERVAL, TREND_KLINE_LIMIT)
   );
-  if (!res.ok) throw new Error(`Klines failed for ${symbol}`);
-  return res.json();
 }
+
+// ==================== Analysis ====================
+// Candle alignment (both timeframes): the final kline (index -1) is the
+// currently forming candle.
+// Last CLOSED candle  => index -2   (the "previous candle" we trade off)
+// The one before it   => index -3   (used to detect the VWAP cross)
 
 function analyze(
   pair: PairData,
   klines: any[],
-): { signal: Signal | null; potential: PotentialOpportunity | null } {
+  trendKlines: any[],
+): SignalRow | null {
   const closes = klines.map((k: any) => parseFloat(k[4]));
-  if (closes.length < 80) return null;
+  const highs = klines.map((k: any) => parseFloat(k[2]));
+  const lows = klines.map((k: any) => parseFloat(k[3]));
+  const volumes = klines.map((k: any) => parseFloat(k[5]));
 
-  const price = closes[closes.length - 2];
-  const highs = klines.map((k) => parseFloat(k[2]));
-  const lows = klines.map((k) => parseFloat(k[3]));
-  const lastOpen = parseFloat(klines[klines.length - 2][1]);
-  const lastHigh = parseFloat(klines[klines.length - 2][2]);
-  const lastLow = parseFloat(klines[klines.length - 2][3]);
+  // ADX needs roughly 2x its period to warm up on the 5m series.
+  if (closes.length < ADX_PERIOD * 2 + 60) return null;
 
-  // EMA50
-  const ema50Values = EMA.calculate({ period: 50, values: closes });
-  const lastEma50 = ema50Values[ema50Values.length - 2];
+  const price = closes.at(-2)!;
+  const prevPrice = closes.at(-3)!;
+  const lastClosedVolume = volumes.at(-2)!;
 
-  // KST
-  const kst = KST.calculate({
-    values: closes,
-    ROCPer1: 8,
-    ROCPer2: 13,
-    ROCPer3: 15,
-    ROCPer4: 25,
-    SMAROCPer1: 8,
-    SMAROCPer2: 8,
-    SMAROCPer3: 8,
-    SMAROCPer4: 12,
-    signalPeriod: 7,
+  // EMA50 — display only, read from the 1H chart, last CLOSED 1H candle so
+  // the value never repaints mid-hour.
+  const trendCloses = trendKlines.map((k: any) => parseFloat(k[4]));
+  if (trendCloses.length < EMA_PERIOD + 10) return null;
+  const lastEMA = EMA.calculate({ period: EMA_PERIOD, values: trendCloses }).at(
+    -2,
+  );
+  if (lastEMA == null) return null;
+
+  // Session VWAP + bands (5m, resets each UTC day)
+  const { vwap, upperBand, lowerBand, sessionIndex } = sessionVwap(
+    klines,
+    VWAP_BAND_STDDEV,
+  );
+  const lastVwap = vwap.at(-2);
+  const prevVwap = vwap.at(-3);
+  const lastUpperBand = upperBand.at(-2);
+  const prevUpperBand = upperBand.at(-3);
+  const lastLowerBand = lowerBand.at(-2);
+  const prevLowerBand = lowerBand.at(-3);
+  const candlesIntoSession = sessionIndex.at(-2) ?? 0;
+  if (
+    lastVwap == null ||
+    prevVwap == null ||
+    lastUpperBand == null ||
+    prevUpperBand == null ||
+    lastLowerBand == null ||
+    prevLowerBand == null
+  )
+    return null;
+  // Right after the UTC rollover VWAP is just the first candle's typical
+  // price — no meaningful line to cross yet.
+  if (candlesIntoSession < 2) return null;
+
+  // DMI / ADX
+  const dmi = adx({
+    high: highs,
+    low: lows,
+    close: closes,
+    period: ADX_PERIOD,
   });
+  const lastDmi = dmi.at(-2);
+  if (lastDmi == null || !Number.isFinite(lastDmi.adx)) return null;
+  const { adx: adxValue, pdi: plusDI, mdi: minusDI } = lastDmi;
 
-  if (kst.length < 3) return null;
+  // RSI on both timeframes. 5m is shown for context; 1H gates the signal.
+  const lastRsi5m = rsi({ period: RSI_PERIOD, values: closes }).at(-2);
+  const lastRsi1h = rsi({ period: RSI_PERIOD, values: trendCloses }).at(-2);
+  if (lastRsi5m == null || lastRsi1h == null) return null;
 
-  const lastKST = kst[kst.length - 2];
-  const prevKST = kst[kst.length - 3];
-  const kstGap = Math.abs(lastKST.kst - lastKST.signal);
-
-  const kstCrossover =
-    prevKST.kst <= prevKST.signal && lastKST.kst > lastKST.signal;
-  const kstCrossunder =
-    prevKST.kst >= prevKST.signal && lastKST.kst < lastKST.signal;
-
-  // StochRSI
-  const stochRSI = StochasticRSI.calculate({
-    values: closes,
-    rsiPeriod: 14,
-    stochasticPeriod: 14,
-    kPeriod: 3,
-    dPeriod: 3,
-  });
-  const lastStochK = stochRSI[stochRSI.length - 2]?.k ?? 50;
-
-  // Z-Score
-  const zLength = 20;
-  const priceMean = sma({ values: closes, period: zLength });
-  const priceMeanLast = priceMean[priceMean.length - 2];
-  const priceStd = sd({ values: closes, period: zLength });
-  const priceStdLast = priceStd[priceStd.length - 2];
-  const zScore = (price - priceMeanLast) / priceStdLast;
-
-  // const atrPeriod = 14;
-  // let atr = 0;
-  // for (let i = closes.length - atrPeriod - 1; i < closes.length - 1; i++) {
-  //   const tr = Math.max(
-  //     parseFloat(klines[i][2]) - parseFloat(klines[i][3]),
-  //     Math.abs(parseFloat(klines[i][2]) - parseFloat(klines[i - 1][4])),
-  //     Math.abs(parseFloat(klines[i][3]) - parseFloat(klines[i - 1][4])),
-  //   );
-  //   atr += tr;
-  // }
-  // atr = atr / atrPeriod;
-  // ATR
+  // ATR -> ATR% (SL/TP distance)
   const lastAtr = atr({
-    period: 14,
+    period: ATR_PERIOD,
     high: highs,
     low: lows,
     close: closes,
   }).at(-2);
+  if (lastAtr == null) return null;
+  const atrPercent = (lastAtr / price) * 100;
 
-  const atrUpper = price + lastAtr * 2;
-  const atrLower = price - lastAtr * 2;
+  // Relative volume vs 20-candle average — display only
+  const lastVolSma = sma({ values: volumes, period: 20 }).at(-2);
+  const relativeVolume =
+    lastVolSma != null && lastVolSma !== 0 ? lastClosedVolume / lastVolSma : 0;
 
-  const volatility = lastAtr / price;
+  // ==================== Entry conditions ====================
+  // LONG : 5m close crosses ABOVE session VWAP or its upper band, with
+  //        +DI > -DI, ADX > 18, and 1H RSI < 70.
+  // SHORT: 5m close crosses BELOW session VWAP or its lower band, with
+  //        -DI > +DI, ADX > 18, and 1H RSI > 40.
+  const crossedAboveVwap =
+    (prevPrice <= prevVwap && price > lastVwap) ||
+    (prevPrice <= prevUpperBand && price > lastUpperBand);
+  const crossedBelowVwap =
+    (prevPrice >= prevVwap && price < lastVwap) ||
+    (prevPrice >= prevLowerBand && price < lastLowerBand);
+  const bullDmi = plusDI > minusDI;
+  const bearDmi = minusDI > plusDI;
+  const strongTrend = adxValue > MIN_ADX;
 
-  const rr = volatility > 0.01 ? 1.2 : 1.2;
+  const shared = {
+    symbol: pair.symbol,
+    strength: adxValue,
+    price: formatPrice(price, pair.tickSize),
+    ema50: formatPrice(lastEMA, pair.tickSize),
+    vwap: formatPrice(lastVwap, pair.tickSize),
+    vwapUpper: formatPrice(lastUpperBand, pair.tickSize),
+    vwapLower: formatPrice(lastLowerBand, pair.tickSize),
+    adx: adxValue.toFixed(1),
+    plusDI: plusDI.toFixed(1),
+    minusDI: minusDI.toFixed(1),
+    rsi5m: lastRsi5m.toFixed(1),
+    rsi1h: lastRsi1h.toFixed(1),
+    volumeRatio: relativeVolume.toFixed(2),
+    atrPercent: atrPercent.toFixed(2),
+    changePercent: pair.changePercent.toFixed(2),
+  };
 
-  let signal: Signal | null = null;
-
-  if (
-    kstCrossover &&
-    kstGap > 0.5 &&
-    lastStochK < 65 &&
-    price > lastEma50 &&
-    zScore > 0
-  ) {
-    const risk = price - atrLower;
-    signal = {
-      symbol: pair.symbol,
+  if (crossedAboveVwap && bullDmi && strongTrend && lastRsi1h < RSI_LONG_MAX) {
+    const slValue = price - lastAtr * ATR_MULTIPLIER;
+    const risk = price - slValue;
+    return {
+      ...shared,
       side: "LONG",
-      strength: kstGap,
-      changePercent: pair.changePercent.toFixed(2),
-      kstGap: kstGap.toFixed(3),
-      stochK: lastStochK.toFixed(2),
-      ema50: lastEma50.toFixed(4),
-      zScore: zScore.toFixed(3),
-      price: formatPrice(price, pair.tickSize),
-      stopLoss: formatPrice(
-        atrLower >= lastLow ? lastLow : atrLower,
-        pair.tickSize,
-      ),
-      takeProfit: formatPrice(price + risk * rr, pair.tickSize),
-      volatility: volatility,
+      stopLoss: formatPrice(slValue, pair.tickSize),
+      takeProfit: formatPrice(price + risk * RISK_REWARD, pair.tickSize),
     };
-  } else if (
-    kstCrossunder &&
-    kstGap > 0.5 &&
-    lastStochK > 45 &&
-    price < lastEma50 &&
-    zScore < 0
-  ) {
-    const risk = price - atrUpper;
-    signal = {
-      symbol: pair.symbol,
+  }
+
+  if (crossedBelowVwap && bearDmi && strongTrend && lastRsi1h > RSI_SHORT_MIN) {
+    const slValue = price + lastAtr * ATR_MULTIPLIER;
+    const risk = slValue - price;
+    return {
+      ...shared,
       side: "SHORT",
-      strength: kstGap,
-      changePercent: pair.changePercent.toFixed(2),
-      kstGap: kstGap.toFixed(3),
-      stochK: lastStochK.toFixed(2),
-      ema50: lastEma50.toFixed(4),
-      zScore: zScore.toFixed(3),
-      price: formatPrice(price, pair.tickSize),
-      stopLoss: formatPrice(
-        atrUpper <= lastHigh ? lastHigh : atrUpper,
-        pair.tickSize,
-      ),
-      takeProfit: formatPrice(price - risk * rr, pair.tickSize),
-      volatility: volatility,
+      stopLoss: formatPrice(slValue, pair.tickSize),
+      takeProfit: formatPrice(price - risk * RISK_REWARD, pair.tickSize),
     };
   }
 
-  // ==================== Potential Opportunity ====================
-  let potential: PotentialOpportunity | null = null;
-  const distancePercent = Math.abs((price - lastEma50) / lastEma50) * 100;
-
-  const isBullishKST = lastKST.kst > lastKST.signal && price > lastEma50;
-  const isBearishKST = lastKST.kst < lastKST.signal && price < lastEma50;
-
-  if (distancePercent <= 1) {
-    if (isBullishKST) {
-      potential = {
-        symbol: pair.symbol,
-        bias: "BULLISH",
-        price: formatPrice(price, pair.tickSize),
-        ema50: lastEma50.toFixed(4),
-        distancePercent: distancePercent.toFixed(2),
-        kstGap: kstGap.toFixed(3),
-        volatility: volatility.toFixed(2),
-        changePercent: pair.changePercent.toFixed(2),
-      };
-    } else if (isBearishKST) {
-      potential = {
-        symbol: pair.symbol,
-        bias: "BEARISH",
-        price: formatPrice(price, pair.tickSize),
-        ema50: lastEma50.toFixed(4),
-        distancePercent: distancePercent.toFixed(2),
-        kstGap: kstGap.toFixed(3),
-        volatility: volatility.toFixed(2),
-        changePercent: pair.changePercent.toFixed(2),
-      };
-    }
-  }
-
-  return { signal, potential };
+  return null;
 }
 
+// ==================== Scan (concurrent batches) ====================
+
 async function scan(): Promise<{
-  strongSignals: Signal[] | null;
-  potentials: PotentialOpportunity[] | null;
+  signals: SignalRow[];
+  rateLimited: boolean;
+  scannedAt: number;
 }> {
   const pairs = await getFilteredPairs();
-  // const results: Signal[] = [];
-  const strongSignals: Signal[] = [];
-  const potentials: PotentialOpportunity[] = [];
+  const signals: SignalRow[] = [];
+  let rateLimited = false;
 
   for (let i = 0; i < pairs.length; i += MAX_CONCURRENT) {
     const chunk = pairs.slice(i, i + MAX_CONCURRENT);
 
-    const chunkPromises = chunk.map(async (pair) => {
-      try {
-        const klines = await getKlines(pair.symbol);
-        return analyze(pair, klines);
-      } catch (error) {
-        console.log("scan error", error);
-        return { signal: null, potential: null };
-      }
-    });
-    const results = await Promise.all(chunkPromises);
-    // console.log(results);
+    // Everything already cached costs nothing — only throttle real traffic.
+    const willHitNetwork = chunk.some((pair) => needsNetwork(pair.symbol));
 
-    for (const res of results) {
-      if (res?.signal) strongSignals.push(res.signal);
-      if (res?.potential) potentials.push(res.potential);
+    if (willHitNetwork && isThrottled()) {
+      rateLimited = true;
+    } else if (willHitNetwork && isNearWeightCap()) {
+      // Too close to the cap to keep going this pass; report what we have.
+      rateLimited = true;
+      break;
+    } else if (willHitNetwork && isPastWeightSoftCap()) {
+      await sleep(weightCooldownMs);
+    }
+
+    const results = await Promise.all(
+      chunk.map(async (pair) => {
+        try {
+          const [entryKlines, trendKlines] = await getPairKlines(pair.symbol);
+          return analyze(pair, entryKlines, trendKlines);
+        } catch (error) {
+          if (error instanceof RateLimitedError) rateLimited = true;
+          else console.log("scan error", pair.symbol, error);
+          return null;
+        }
+      }),
+    );
+
+    for (const signal of results) {
+      if (signal) signals.push(signal);
+    }
+
+    // Stagger batches so a cold cache doesn't burst-fire every klines request
+    // at once and trip Binance's request-weight limiter.
+    if (willHitNetwork && i + MAX_CONCURRENT < pairs.length) {
+      await sleep(BATCH_DELAY_MS);
     }
   }
 
   return {
-    strongSignals: strongSignals.sort((a, b) => b.strength - a.strength),
-    potentials: potentials.sort(
-      (a, b) => parseFloat(b.volatility) - parseFloat(a.volatility),
-    ),
+    signals: signals.sort((a, b) => b.strength - a.strength),
+    rateLimited,
+    scannedAt: Date.now(),
   };
 }
 
+// ==================== Page ====================
+
 export default async function BinanceFuturesScanner() {
-  let strongSignals: Signal[] = [];
-  let potentials: PotentialOpportunity[] = [];
+  let signals: SignalRow[] = [];
+  let rateLimited = false;
+  let scannedAt = 0;
+
   try {
     const data = await scan();
-    strongSignals = data.strongSignals;
-    potentials = data.potentials;
+    signals = data.signals;
+    rateLimited = data.rateLimited;
+    scannedAt = data.scannedAt;
   } catch (error) {
-    console.log("signals", error);
+    // Next signals "this route must render dynamically" by throwing — that's
+    // control flow, not a scanner failure, so it has to pass straight through.
+    unstable_rethrow(error);
+    console.log("scanner error", error);
     return (
       <div className="min-h-screen bg-gray-950 text-red-400 flex items-center justify-center p-10">
         <div className="text-center">
@@ -360,37 +407,56 @@ export default async function BinanceFuturesScanner() {
       <div className="max-w-7xl mx-auto space-y-16">
         <div className="text-center">
           <h1 className="text-5xl font-bold tracking-tight mb-3">
-            Binance USDT Futures Scanner
+            Binance Futures 5M VWAP Cross Scanner
           </h1>
           <p className="text-gray-400">
-            1H • KST + StochRSI • Combined Analysis
+            5M VWAP/Band Cross • DMI (+DI/−DI) • ADX &gt; {MIN_ADX} • 1H RSI
+            Filter
           </p>
+          <AutoRefresh
+            candleMs={ENTRY_CANDLE_MS}
+            graceMs={CANDLE_CACHE_GRACE_MS}
+            scannedAt={scannedAt}
+          />
+          {rateLimited && (
+            <p className="mt-4 inline-block rounded-full bg-amber-500/15 px-4 py-2 text-sm text-amber-400">
+              ⚠️ Binance rate limit reached — some pairs were served from cache
+              or skipped. Refresh in a minute for a full scan.
+            </p>
+          )}
         </div>
 
-        {/* Strong Signals */}
+        {/* Signals */}
         <div className="bg-gray-900 rounded-3xl shadow-2xl p-8">
           <h2 className="text-3xl font-semibold mb-6 text-white flex items-center gap-3">
-            🔥 Strong Confirmed Signals
+            🔥 Signals
           </h2>
-          {/* Table code same as previous response - omitted for brevity, but you can copy from last message */}
           <div className="overflow-x-auto">
             <table className="w-full text-sm">
               <thead className="text-gray-400 border-b border-gray-700">
                 <tr>
                   <th className="text-left py-4">Rank</th>
                   <th className="text-left py-4">Pair</th>
-                  <th className="text-left py-4">Direction</th>
+                  <th className="text-left py-4">Side</th>
                   <th className="text-left py-4">Price</th>
+                  <th className="text-left py-4">1H EMA{EMA_PERIOD}</th>
+                  <th className="text-left py-4">VWAP</th>
+                  <th className="text-left py-4">VWAP Upper</th>
+                  <th className="text-left py-4">VWAP Lower</th>
+                  <th className="text-left py-4">ADX</th>
+                  <th className="text-left py-4">+DI</th>
+                  <th className="text-left py-4">−DI</th>
+                  <th className="text-left py-4">RSI 5M</th>
+                  <th className="text-left py-4">RSI 1H</th>
+                  <th className="text-left py-4">RVOL</th>
+                  <th className="text-left py-4">ATR%</th>
                   <th className="text-left py-4">24h %</th>
-                  <th className="text-left py-4">KST Gap</th>
-                  <th className="text-left py-4">Stoch %K</th>
-                  <th className="text-left py-4">Z-Score</th>
                   <th className="text-left py-4">SL</th>
                   <th className="text-left py-4">TP</th>
                 </tr>
               </thead>
               <tbody>
-                {strongSignals.map((s, i) => (
+                {signals.map((s, i) => (
                   <tr
                     key={s.symbol}
                     className="border-b border-gray-800 hover:bg-gray-800/70 transition-colors"
@@ -399,91 +465,53 @@ export default async function BinanceFuturesScanner() {
                     <td className="py-4 font-semibold">{s.symbol}</td>
                     <td className="py-4">
                       <span
-                        className={`px-3 py-1 rounded-full text-xs font-bold ${s.side === "LONG" ? "bg-green-500/20 text-green-400" : "bg-red-500/20 text-red-400"}`}
+                        className={`px-3 py-1 rounded-full text-xs font-bold ${
+                          s.side === "LONG"
+                            ? "bg-green-500/20 text-green-400"
+                            : "bg-red-500/20 text-red-400"
+                        }`}
                       >
                         {s.side}
                       </span>
                     </td>
                     <td className="py-4 font-mono">{s.price}</td>
+                    <td className="py-4 font-mono text-gray-300">{s.ema50}</td>
+                    <td className="py-4 font-mono text-cyan-400">{s.vwap}</td>
+                    <td className="py-4 font-mono text-cyan-300">
+                      {s.vwapUpper}
+                    </td>
+                    <td className="py-4 font-mono text-cyan-300">
+                      {s.vwapLower}
+                    </td>
+                    <td className="py-4 font-medium">{s.adx}</td>
+                    <td className="py-4 text-green-400">{s.plusDI}</td>
+                    <td className="py-4 text-red-400">{s.minusDI}</td>
+                    <td className="py-4">{s.rsi5m}</td>
+                    <td className="py-4 text-gray-300">{s.rsi1h}</td>
+                    <td className="py-4 font-medium text-blue-400">
+                      {s.volumeRatio}×
+                    </td>
+                    <td className="py-4 font-medium text-purple-400">
+                      {s.atrPercent}%
+                    </td>
                     <td
-                      className={`py-4 font-medium ${s.side === "LONG" ? "text-green-400" : "text-red-400"}`}
+                      className={`py-4 font-medium ${
+                        parseFloat(s.changePercent) >= 0
+                          ? "text-green-400"
+                          : "text-red-400"
+                      }`}
                     >
-                      {s.side === "LONG" ? "+" : ""}
+                      {parseFloat(s.changePercent) >= 0 ? "+" : ""}
                       {s.changePercent}%
                     </td>
-                    <td className="py-4 font-medium">{s.kstGap}</td>
-                    <td className="py-4">{s.stochK}</td>
-                    <td className="py-4">{s.zScore}</td>
                     <td className="py-4 text-orange-400">{s.stopLoss}</td>
                     <td className="py-4 text-emerald-400">{s.takeProfit}</td>
                   </tr>
                 ))}
-                {strongSignals.length === 0 && (
+                {signals.length === 0 && (
                   <tr>
-                    <td
-                      colSpan={10}
-                      className="py-12 text-center text-gray-500"
-                    >
-                      No strong signals currently
-                    </td>
-                  </tr>
-                )}
-              </tbody>
-            </table>
-          </div>
-        </div>
-
-        {/* Potential Opportunities */}
-        <div className="bg-gray-900 rounded-3xl shadow-2xl p-8">
-          <h2 className="text-3xl font-semibold mb-6 text-amber-400 flex items-center gap-3">
-            ⭐ Potential Opportunities (Near EMA50)
-          </h2>
-          <div className="overflow-x-auto">
-            <table className="w-full text-sm">
-              <thead className="text-gray-400 border-b border-gray-700">
-                <tr>
-                  <th className="text-left py-4">Rank</th>
-                  <th className="text-left py-4">Pair</th>
-                  <th className="text-left py-4">Bias</th>
-                  <th className="text-left py-4">Price</th>
-                  <th className="text-left py-4">EMA50</th>
-                  <th className="text-left py-4">Distance</th>
-                  <th className="text-left py-4">KST Gap</th>
-                  <th className="text-left py-4">Volatility %</th>
-                  <th className="text-left py-4">24h %</th>
-                </tr>
-              </thead>
-              <tbody>
-                {potentials.map((p, i) => (
-                  <tr
-                    key={p.symbol}
-                    className="border-b border-gray-800 hover:bg-gray-800/70 transition-colors"
-                  >
-                    <td className="py-4">{i + 1}</td>
-                    <td className="py-4 font-semibold">{p.symbol}</td>
-                    <td className="py-4">
-                      <span
-                        className={`px-3 py-1 rounded-full text-xs font-bold ${p.bias === "BULLISH" ? "bg-green-500/20 text-green-400" : "bg-red-500/20 text-red-400"}`}
-                      >
-                        {p.bias}
-                      </span>
-                    </td>
-                    <td className="py-4 font-mono">{p.price}</td>
-                    <td className="py-4 text-gray-300">{p.ema50}</td>
-                    <td className="py-4 text-amber-400">
-                      {p.distancePercent}%
-                    </td>
-                    <td className="py-4">{p.kstGap}</td>
-                    <td className="py-4 font-medium text-purple-400">
-                      {p.volatility}%
-                    </td>
-                    <td className="py-4">{p.changePercent}%</td>
-                  </tr>
-                ))}
-                {potentials.length === 0 && (
-                  <tr>
-                    <td colSpan={9} className="py-12 text-center text-gray-500">
-                      No potential opportunities near EMA50 right now
+                    <td colSpan={18} className="py-12 text-center text-gray-500">
+                      No VWAP/band cross signals on the last closed 5m candle
                     </td>
                   </tr>
                 )}
@@ -493,8 +521,16 @@ export default async function BinanceFuturesScanner() {
         </div>
 
         <p className="text-center text-xs text-gray-500">
-          Potential Opportunities: Price within 1.8% of EMA50 + KST bias +
-          Volatility ≥ 0.8%
+          Closed candles only, never the forming one • LONG = 5M close crosses
+          ABOVE session VWAP or its upper band ({VWAP_BAND_STDDEV}σ) +
+          &plus;DI &gt; &minus;DI + ADX &gt; {MIN_ADX} + 1H RSI &lt;{" "}
+          {RSI_LONG_MAX} • SHORT = 5M close crosses BELOW session VWAP or its
+          lower band ({VWAP_BAND_STDDEV}σ) + &minus;DI &gt; &plus;DI + ADX
+          &gt; {MIN_ADX} + 1H RSI &gt; {RSI_SHORT_MIN} • Requires 24h quote
+          volume ≥ ${(MIN_VOLUME / 1_000_000).toFixed(0)}M • DMI/ADX/ATR are
+          5M; EMA{EMA_PERIOD} and gating RSI are 1H • VWAP re-anchors every
+          UTC midnight • EMA{EMA_PERIOD}, RVOL, ATR% and 5M RSI are shown for
+          context only
         </p>
       </div>
     </div>
