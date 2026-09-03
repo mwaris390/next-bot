@@ -1,0 +1,214 @@
+//@version=6
+// ═══════════════════════════════════════════════════════════════════════════
+//  KST + StochRSI + EMA50 Pullback
+//
+//  LONG  : KST crossed above its signal, StochRSI %K <= 65, a GREEN candle
+//          closing above EMA50 that is either hugging the EMA (pullback) or
+//          has just crossed above it.
+//  SHORT : mirror image (%K >= 35, red candle below/crossing below EMA50).
+//
+//  Bollinger Bands are drawn and the squeeze COLOURS the chart (band fill and
+//  background shading), but it does NOT gate the signal for now.
+//
+//  TWO CLOCKS, on purpose:
+//
+//    INDICATORS — KST, its signal, StochRSI %K, BB bandwidth and the squeeze —
+//    read the LIVE, still-forming candle, so they agree with TradingView's
+//    built-ins tick for tick and give the freshest read.
+//
+//    PRICE STRUCTURE — candle colour, close vs EMA 50, the pullback distance
+//    and the EMA cross — stays on the LAST CLOSED candle [1], because a
+//    forming candle's colour and close are not decided yet: a green candle
+//    hugging the EMA can end the bar red and below it.
+//
+//  So a flag means "these indicators, right now, on that finished setup
+//  candle" — and the marker is drawn back onto that candle via `offset = -1`.
+//  The cost is finality: live indicator values move, so a flag can appear and
+//  vanish before the bar closes. "Indicators Read" = Closed candle puts
+//  everything back on one clock and makes the script final-on-close.
+// ═══════════════════════════════════════════════════════════════════════════
+indicator("KST + StochRSI + EMA50 Pullback", shorttitle = "KST PB",
+     overlay = true, max_labels_count = 500)
+
+// ─────────────────────────── INPUTS ───────────────────────────
+grpCALC = "Calculation"
+calcSrc = input.string("Live candle", "Indicators Read", options = ["Live candle", "Closed candle"], group = grpCALC,
+     tooltip = "Applies to KST, its signal, StochRSI %K and the BB squeeze. " +
+               "Live candle: values come from the still-forming bar and match TradingView's built-in " +
+               "indicators, at the cost of moving until the bar closes. " +
+               "Closed candle: everything reads the last closed bar, so nothing moves once a bar is final. " +
+               "Candle colour, the EMA 50 test and the pullback distance ALWAYS read the closed candle.", display = display.none)
+
+grpEMA = "EMA"
+emaLen = input.int(50, "EMA Length", minval = 1, group = grpEMA, display = display.none)
+
+grpPB  = "Pullback Proximity to EMA"
+proxMode = input.string("ATR", "Distance Measured In", options = ["ATR", "Percent"], group = grpPB,
+     tooltip = "How close the candle must come to the EMA to count as a pullback. " +
+               "ATR adapts to the symbol's volatility; Percent is a fixed distance from price.", display = display.none)
+atrLen  = input.int(14,   "ATR Length",              minval = 1, group = grpPB, display = display.none)
+proxAtr = input.float(0.5,"Max Distance (× ATR)",    minval = 0.05, step = 0.05, group = grpPB,
+     tooltip = "Distance from the EMA to the near edge of the candle (its low for longs, high for shorts). " +
+               "0 if the candle tags or pierces the EMA.", display = display.none)
+proxPct = input.float(0.5,"Max Distance (% of price)", minval = 0.01, step = 0.05, group = grpPB, display = display.none)
+
+grpKST = "KST"
+kRoc1 = input.int(10, "ROC 1", minval = 1, group = grpKST, inline = "roc", display = display.none)
+kRoc2 = input.int(13, "ROC 2", minval = 1, group = grpKST, inline = "roc", display = display.none)
+kRoc3 = input.int(15, "ROC 3", minval = 1, group = grpKST, inline = "roc", display = display.none)
+kRoc4 = input.int(25, "ROC 4", minval = 1, group = grpKST, inline = "roc", display = display.none)
+kSma1 = input.int(10, "SMA 1", minval = 1, group = grpKST, inline = "sma", display = display.none)
+kSma2 = input.int(13, "SMA 2", minval = 1, group = grpKST, inline = "sma", display = display.none)
+kSma3 = input.int(15, "SMA 3", minval = 1, group = grpKST, inline = "sma", display = display.none)
+kSma4 = input.int(25, "SMA 4", minval = 1, group = grpKST, inline = "sma", display = display.none)
+kSig  = input.int(7,  "Signal", minval = 1, group = grpKST, display = display.none)
+crossLb = input.int(3, "Cross Valid For (closed bars)", minval = 1, maxval = 20, group = grpKST,
+     tooltip = "1 = the cross must land exactly on the last closed candle. Higher values let the " +
+               "pullback develop for a few bars after the cross while KST stays on the right side of its signal.", display = display.none)
+
+grpST = "Stochastic RSI"
+smoothK     = input.int(3,  "K", minval = 1, group = grpST, display = display.none)
+smoothD     = input.int(3,  "D", minval = 1, group = grpST, display = display.none)
+lengthRSI   = input.int(14, "RSI Length",        minval = 1, group = grpST, display = display.none)
+lengthStoch = input.int(14, "Stochastic Length", minval = 1, group = grpST, display = display.none)
+rsiSrc      = input.source(close, "RSI Source", group = grpST, display = display.none)
+kMaxLong    = input.float(65, "Long: %K at or below",  minval = 0, maxval = 100, group = grpST, display = display.none)
+kMinShort   = input.float(35, "Short: %K at or above", minval = 0, maxval = 100, group = grpST, display = display.none)
+
+grpBB    = "Bollinger Bands / Squeeze (colour only)"
+bbSrc    = input.source(close, "Source",  group = grpBB, display = display.none)
+bbLen    = input.int(20,    "BB Length",  minval = 2,   group = grpBB, display = display.none)
+bbMult   = input.float(2.0, "BB StdDev",  minval = 0.1, step = 0.1, group = grpBB, display = display.none)
+showBB   = input.bool(true, "Show bands", group = grpBB, display = display.none)
+lookback  = input.int(240, "Bandwidth Lookback (bars)", minval = 30, group = grpBB,
+     tooltip = "Where current bandwidth ranks against recent history. Colour only — " +
+               "the squeeze does not gate signals right now.", display = display.none)
+pctThresh = input.float(20, "Squeeze Percentile (%)", minval = 1, maxval = 100, step = 1, group = grpBB,
+     tooltip = "Bandwidth in the bottom X% of the last `lookback` bars paints as a squeeze. " +
+               "Half that threshold paints as an extreme squeeze.", display = display.none)
+showBG    = input.bool(true, "Shade squeeze background", group = grpBB, display = display.none)
+
+grpSIG   = "Signals"
+cooldown = input.int(0, "Min bars between flags", minval = 0, group = grpSIG,
+     tooltip = "0 = every qualifying bar prints. Raise it to thin out clusters when the same setup " +
+               "stays valid for several bars in a row.", display = display.none)
+
+// ─────────────────────────── EMA 50 ───────────────────────────
+ema = ta.ema(close, emaLen)
+
+// ──────────────────────────── KST ─────────────────────────────
+// Body copied verbatim from TradingView's built-in "Know Sure Thing".
+// Only the input DEFAULTS differ (ours: 10/13/15/25, 10/13/15/25, signal 7 —
+// the built-in ships 10/15/20/30, 10/10/10/15, signal 9), so point the built-in
+// at our numbers if you want the two to print the same value.
+smaroc(roclen, smalen) => ta.sma(ta.roc(close, roclen), smalen)
+kst = smaroc(kRoc1, kSma1) + 2 * smaroc(kRoc2, kSma2) + 3 * smaroc(kRoc3, kSma3) + 4 * smaroc(kRoc4, kSma4)
+sig = ta.sma(kst, kSig)
+
+// ───────────────────── STOCHASTIC RSI (3,3,14,14) ─────────────
+// Body copied verbatim from TradingView's built-in "Stochastic RSI",
+// with the same defaults — these print identical values to it.
+rsi1 = ta.rsi(rsiSrc, lengthRSI)
+k    = ta.sma(ta.stoch(rsi1, rsi1, rsi1, lengthStoch), smoothK)
+d    = ta.sma(k, smoothD)
+
+// ─────────────────── BOLLINGER BANDS (no longer a gate) ───────
+basis = ta.sma(bbSrc, bbLen)
+dev   = bbMult * ta.stdev(bbSrc, bbLen)
+upper = basis + dev
+lower = basis - dev
+
+// Bandwidth normalised by the basis so it compares across price levels, then
+// ranked against the prior `lookback` bars. Drives colour only — no gating.
+bbw   = basis != 0 ? (upper - lower) / basis * 100 : na
+rank  = ta.percentrank(bbw, lookback)
+
+enoughData = bar_index > lookback + bbLen
+squeeze    = enoughData and not na(rank) and rank <= pctThresh
+extreme    = squeeze and rank <= pctThresh / 2
+
+// ═════════════════════ THE TWO CLOCKS ════════════════════════════════════
+// `live` picks the indicator clock; the price-structure block further down is
+// hard-wired to the closed candle regardless.
+live = calcSrc == "Live candle"
+
+kstUse = live ? kst : kst[1]
+sigUse = live ? sig : sig[1]
+kUse   = live ? k   : k[1]
+sqzUse = live ? squeeze : squeeze[1]
+extUse = live ? extreme : extreme[1]
+
+// KST cross, still valid within the lookback window and on the right side.
+barsSinceUp = ta.barssince(ta.crossover(kst, sig))
+barsSinceDn = ta.barssince(ta.crossunder(kst, sig))
+bsUp = live ? barsSinceUp : barsSinceUp[1]
+bsDn = live ? barsSinceDn : barsSinceDn[1]
+kstLong  = kstUse > sigUse and nz(bsUp, 999999) <= crossLb - 1
+kstShort = kstUse < sigUse and nz(bsDn, 999999) <= crossLb - 1
+
+// Stochastic RSI %K gate.
+stochLong  = kUse <= kMaxLong
+stochShort = kUse >= kMinShort
+
+// ── Price structure: ALWAYS the last closed candle ───────────────────────
+// How close the closed candle came to the EMA — 0 when it tagged or pierced it.
+atrVal    = ta.atr(atrLen)
+prox      = proxMode == "ATR" ? proxAtr * nz(atrVal[1]) : close[1] * proxPct / 100
+distLong  = low[1]  <= ema[1] ? 0.0 : low[1]  - ema[1]   // pullback into the EMA from above
+distShort = high[1] >= ema[1] ? 0.0 : ema[1] - high[1]   // pullback into the EMA from below
+
+green = close[1] > open[1]
+red   = close[1] < open[1]
+
+// Either hugging the EMA, or crossing it on this very candle.
+emaCrossUp = close[1] > ema[1] and close[2] <= ema[2]
+emaCrossDn = close[1] < ema[1] and close[2] >= ema[2]
+
+longStruct  = green and close[1] > ema[1] and (distLong  <= prox or emaCrossUp)
+shortStruct = red   and close[1] < ema[1] and (distShort <= prox or emaCrossDn)
+
+longRaw  = kstLong  and stochLong  and longStruct
+shortRaw = kstShort and stochShort and shortStruct
+
+// Optional thinning of back-to-back flags.
+var int lastSigBar = na
+canFire  = cooldown == 0 or na(lastSigBar) or bar_index - lastSigBar >= cooldown
+longSig  = longRaw  and canFire
+shortSig = shortRaw and canFire
+if longSig or shortSig
+    lastSigBar := bar_index
+
+// ────────────────────────── PLOTTING ──────────────────────────
+plot(ema, "EMA 50", color.new(color.orange, 0), 2)
+
+pUp = plot(showBB ? upper : na, "BB Upper", color.new(color.blue, 30), display = display.all - display.status_line)
+pLo = plot(showBB ? lower : na, "BB Lower", color.new(color.blue, 30), display = display.all - display.status_line)
+plot(showBB ? basis : na, "BB Basis", color.new(color.blue, 60), display = display.all - display.status_line)
+fill(pUp, pLo, color = sqzUse ? color.new(color.yellow, 88) : color.new(color.blue, 95), title = "BB Fill")
+
+// Squeeze shading, painted on whichever bar it was measured on. Two calls
+// because `offset` is fixed at compile time — only one is ever active.
+sqzCol = extUse ? color.new(color.orange, 85) : sqzUse ? color.new(color.yellow, 91) : na
+bgcolor(showBG and live     ? sqzCol : na, title = "Squeeze Shading (live)")
+bgcolor(showBG and not live ? sqzCol : na, offset = -1, title = "Squeeze Shading (closed)")
+
+// Flags are drawn back onto the closed candle that produced them.
+plotshape(longSig, "LONG", shape.labelup, location.belowbar, color.new(color.green, 10),
+     text = "LONG", textcolor = color.white, size = size.small, offset = -1, display = display.pane)
+plotshape(shortSig, "SHORT", shape.labeldown, location.abovebar, color.new(color.red, 10),
+     text = "SHORT", textcolor = color.white, size = size.small, offset = -1, display = display.pane)
+
+// ─────────────────────── STATUS LINE READOUT ──────────────────
+// These show EXACTLY the values the gates above test — no separate display
+// mode that can drift out of sync with the logic. On the default (Live
+// candle) all three match TradingView's built-ins directly; on Closed candle
+// they are one bar behind them, so hover the previous candle to compare.
+statusOnly = display.status_line + display.data_window
+
+// `precision` matters here: this is an overlay indicator, so without it these
+// values inherit the SYMBOL's tick formatting and get rounded to price
+// precision — e.g. %K 63.52 shown as "63.5". The built-ins use precision 4
+// (KST) and 2 (Stoch RSI); matching them makes the readouts comparable.
+plot(kstUse, "KST",         #00C853, display = statusOnly, precision = 4)   // green
+plot(sigUse, "KST Signal",  #F44336, display = statusOnly, precision = 4)   // red
+plot(kUse,   "StochRSI %K", #38BDF8, display = statusOnly, precision = 2)   // sky blue

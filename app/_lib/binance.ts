@@ -61,12 +61,6 @@ export function isPastWeightSoftCap(): boolean {
 
 export const weightCooldownMs = WEIGHT_COOLDOWN_MS;
 
-/** Cache klines until the candle we're reading is superseded by a new close. */
-export function nextCandleExpiry(candleMs: number): number {
-  const now = Date.now();
-  return now - (now % candleMs) + candleMs + CANDLE_CACHE_GRACE_MS;
-}
-
 export function formatPrice(price: number | string, tickSize: string): string {
   const ts = parseFloat(tickSize);
   const decimals = ts >= 1 ? 0 : Math.abs(Math.floor(Math.log10(ts))) || 2;
@@ -153,11 +147,19 @@ export async function getFilteredPairs(
 // series must never be handed to a caller that asked for more of it.
 const klinesCache = new Map<string, { data: any[]; expiresAt: number }>();
 
+/**
+ * `ttlMs` is the caller's call because it depends on WHICH candle they read.
+ * A scanner that only judges CLOSED candles can hold a series until the next
+ * close and spend nothing in between. One that reads the LIVE, still-forming
+ * candle — as the KST scanner does, to match TradingView — must use a short
+ * TTL instead, or its indicators freeze at whatever they happened to be when
+ * the hour turned.
+ */
 export async function getKlines(
   symbol: string,
   interval: string,
   limit: number,
-  candleMs: number,
+  ttlMs: number,
 ): Promise<any[]> {
   const key = `${symbol}:${interval}:${limit}`;
   const cached = klinesCache.get(key);
@@ -167,7 +169,7 @@ export async function getKlines(
     const data = await binanceFetch(
       `${FAPI}/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`,
     );
-    klinesCache.set(key, { data, expiresAt: nextCandleExpiry(candleMs) });
+    klinesCache.set(key, { data, expiresAt: Date.now() + ttlMs });
     return data;
   } catch (error) {
     // Stale candles beat no candles while we're backing off.

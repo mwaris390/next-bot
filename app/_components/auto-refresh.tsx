@@ -10,7 +10,7 @@ import {
 import { useRouter } from "next/navigation";
 
 interface AutoRefreshProps {
-  /** Length of the entry candle in ms — refresh fires when one closes. */
+  /** Length of the entry candle in ms — one scan fires per close. */
   candleMs: number;
   /** Wait this long past the close so Binance has published the candle. */
   graceMs: number;
@@ -18,8 +18,11 @@ interface AutoRefreshProps {
   scannedAt: number;
 }
 
-function msUntilNextClose(candleMs: number, graceMs: number): number {
-  const now = Date.now();
+function msUntilNextClose(
+  now: number,
+  candleMs: number,
+  graceMs: number,
+): number {
   return candleMs - (now % candleMs) + graceMs;
 }
 
@@ -47,9 +50,17 @@ function getServerSecondsSnapshot(): null {
 }
 
 /**
- * Re-renders the scanner the moment each entry candle closes. The server's
- * klines cache expires on the same boundary, so exactly one refresh per candle
- * pulls fresh data — anything more would be served from cache anyway.
+ * Re-scans once per candle, the moment each one closes.
+ *
+ * The server's klines cache expires on the same boundary, so exactly one scan
+ * per candle pulls fresh data and anything more would be served from cache
+ * anyway. The timer is scheduled at the boundary and re-armed afterwards
+ * rather than polling for the crossing.
+ *
+ * The scanner's indicators read the still-forming candle (see
+ * app/_lib/kst-pullback.ts), so this samples them just after the close and
+ * holds that reading for the hour — "Refresh now" re-samples when you want to
+ * line the numbers back up with a chart mid-candle.
  */
 export default function AutoRefresh({
   candleMs,
@@ -73,8 +84,6 @@ export default function AutoRefresh({
     startRefresh(() => router.refresh());
   }, [router]);
 
-  // Fire once per candle close by scheduling the timer at the exact boundary
-  // and re-arming it afterwards, instead of polling for the crossing.
   useEffect(() => {
     if (!enabled) return;
 
@@ -83,15 +92,18 @@ export default function AutoRefresh({
       timer = setTimeout(() => {
         refresh();
         schedule();
-      }, msUntilNextClose(candleMs, graceMs));
+      }, msUntilNextClose(Date.now(), candleMs, graceMs));
     };
 
     schedule();
     return () => clearTimeout(timer);
   }, [enabled, candleMs, graceMs, refresh]);
 
-  const remaining =
-    nowSeconds == null ? null : msUntilNextClose(candleMs, graceMs);
+  // Derived from the seconds store rather than a fresh `Date.now()`, so the
+  // render stays pure and the countdown still ticks once a second.
+  const now = nowSeconds == null ? null : nowSeconds * 1000;
+  const untilClose =
+    now == null ? null : msUntilNextClose(now, candleMs, graceMs);
 
   return (
     <div className="mt-5 flex flex-wrap items-center justify-center gap-3 text-sm">
@@ -104,7 +116,7 @@ export default function AutoRefresh({
             : "bg-gray-800 text-gray-400 hover:bg-gray-700"
         }`}
       >
-        {enabled ? "● Auto-refresh ON" : "○ Auto-refresh OFF"}
+        {enabled ? "● Auto-scan ON" : "○ Auto-scan OFF"}
       </button>
 
       <span className="text-gray-500">
@@ -112,9 +124,9 @@ export default function AutoRefresh({
           ? "Scanning…"
           : !enabled
             ? "Paused"
-            : remaining == null
-              ? "Next candle in —:—"
-              : `Next candle in ${formatCountdown(remaining)}`}
+            : untilClose == null
+              ? "Next scan at candle close"
+              : `Next scan in ${formatCountdown(untilClose)}`}
       </span>
 
       <button
