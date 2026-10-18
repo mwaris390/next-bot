@@ -10,27 +10,44 @@ import {
 import { useRouter } from "next/navigation";
 
 interface AutoRefreshProps {
-  /** Length of the entry candle in ms — one scan fires per close. */
+  /** Length of the entry candle in ms — what the structure half waits for. */
   candleMs: number;
-  /** Wait this long past the close so Binance has published the candle. */
+  /**
+   * How often to re-scan, when that is shorter than a candle. On a 4h chart
+   * the live indicators would otherwise sit four hours stale, so the page
+   * re-samples inside the candle; it must divide `candleMs` so that every
+   * close is also a sample boundary. Defaults to one scan per candle.
+   */
+  sampleMs?: number;
+  /** Wait this long past the boundary so Binance has published the candle. */
   graceMs: number;
   /** Server render time, so we can show when the data was last scanned. */
   scannedAt: number;
 }
 
-function msUntilNextClose(
+function msUntilNextBoundary(
   now: number,
-  candleMs: number,
+  periodMs: number,
   graceMs: number,
 ): number {
-  return candleMs - (now % candleMs) + graceMs;
+  return periodMs - (now % periodMs) + graceMs;
 }
 
 function formatCountdown(ms: number): string {
   const total = Math.max(0, Math.ceil(ms / 1000));
-  const minutes = Math.floor(total / 60);
+  const hours = Math.floor(total / 3600);
+  const minutes = Math.floor((total % 3600) / 60);
   const seconds = total % 60;
-  return `${minutes}:${seconds.toString().padStart(2, "0")}`;
+  const pad = (value: number) => value.toString().padStart(2, "0");
+  return hours > 0
+    ? `${hours}:${pad(minutes)}:${pad(seconds)}`
+    : `${minutes}:${pad(seconds)}`;
+}
+
+/** "4h" / "1h" / "15m" — the candle length, for the close countdown's label. */
+function candleLabel(candleMs: number): string {
+  const minutes = Math.round(candleMs / 60_000);
+  return minutes % 60 === 0 ? `${minutes / 60}h` : `${minutes}m`;
 }
 
 // A one-second clock modelled as an external store. Reading the time this way
@@ -50,23 +67,26 @@ function getServerSecondsSnapshot(): null {
 }
 
 /**
- * Re-scans once per candle, the moment each one closes.
+ * Re-scans on every sample boundary — which, when `sampleMs` is a whole
+ * division of `candleMs`, includes each candle close.
  *
- * The server's klines cache expires on the same boundary, so exactly one scan
- * per candle pulls fresh data and anything more would be served from cache
+ * The server's klines cache expires on the same boundary, so one scan per
+ * boundary pulls fresh data and anything in between is served from cache
  * anyway. The timer is scheduled at the boundary and re-armed afterwards
  * rather than polling for the crossing.
  *
- * The scanner's indicators read the still-forming candle (see
- * app/_lib/kst-pullback.ts), so this samples them just after the close and
- * holds that reading for the hour — "Refresh now" re-samples when you want to
- * line the numbers back up with a chart mid-candle.
+ * The watchlist reads closed candles only (see app/_lib/watchlist.ts), so
+ * it omits `sampleMs` and scans once per close. `sampleMs` stays for a scanner
+ * whose indicators read the still-forming candle. "Refresh now" re-reads on
+ * demand.
  */
 export default function AutoRefresh({
   candleMs,
+  sampleMs,
   graceMs,
   scannedAt,
 }: AutoRefreshProps) {
+  const scanMs = sampleMs ?? candleMs;
   const router = useRouter();
   const [enabled, setEnabled] = useState(true);
 
@@ -92,18 +112,24 @@ export default function AutoRefresh({
       timer = setTimeout(() => {
         refresh();
         schedule();
-      }, msUntilNextClose(Date.now(), candleMs, graceMs));
+      }, msUntilNextBoundary(Date.now(), scanMs, graceMs));
     };
 
     schedule();
     return () => clearTimeout(timer);
-  }, [enabled, candleMs, graceMs, refresh]);
+  }, [enabled, scanMs, graceMs, refresh]);
 
   // Derived from the seconds store rather than a fresh `Date.now()`, so the
   // render stays pure and the countdown still ticks once a second.
   const now = nowSeconds == null ? null : nowSeconds * 1000;
+  const untilScan =
+    now == null ? null : msUntilNextBoundary(now, scanMs, graceMs);
+  // Only worth showing when a scan is not the same event as a close: it is the
+  // clock the structure half of the table actually waits on.
   const untilClose =
-    now == null ? null : msUntilNextClose(now, candleMs, graceMs);
+    now == null || scanMs >= candleMs
+      ? null
+      : msUntilNextBoundary(now, candleMs, graceMs);
 
   return (
     <div className="mt-5 flex flex-wrap items-center justify-center gap-3 text-sm">
@@ -124,10 +150,16 @@ export default function AutoRefresh({
           ? "Scanning…"
           : !enabled
             ? "Paused"
-            : untilClose == null
-              ? "Next scan at candle close"
-              : `Next scan in ${formatCountdown(untilClose)}`}
+            : untilScan == null
+              ? "Next scan at the sample boundary"
+              : `Next scan in ${formatCountdown(untilScan)}`}
       </span>
+
+      {untilClose != null && (
+        <span className="text-gray-600">
+          {candleLabel(candleMs)} close in {formatCountdown(untilClose)}
+        </span>
+      )}
 
       <button
         type="button"

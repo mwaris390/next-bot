@@ -1,25 +1,21 @@
 // Pine-faithful series math.
 //
 // Every helper returns an array the SAME LENGTH as its input, NaN-padded
-// through warm-up, so indices line up with the kline array they came from.
-// That is the whole point: the scanner runs two clocks at once — indicators on
-// the live, still-forming candle and price structure on the last closed one —
-// and it can only index the same series at two different offsets if nothing
-// has been trimmed or shifted.
+// through warm-up, so indices line up with the kline array they came from —
+// the scanner can read the live and the last closed candle off one series.
 //
 // (The `technicalindicators` package trims its output to `length - period + 1`
 // instead, which silently shifts every index, so none of this can use it.)
 //
 // Each function names the TradingView built-in it reproduces. Where Pine and
-// the textbook disagree — `ta.stdev` dividing by N, `ta.rma`/`ta.ema` seeding
-// on an SMA, `ta.percentrank` excluding the current bar — Pine wins, because
-// these numbers are meant to match what the chart prints.
+// the textbook disagree — `ta.rma` and `ta.ema` seeding on an SMA rather than
+// on the first value — Pine wins, because these numbers are meant to match
+// what the chart prints.
 
 /**
  * `ta.sma` — rolling simple moving average.
  *
- * NaN-aware, and it has to be: this gets fed the warm-up-padded output of
- * `rocSeries`, `stochSeries` and KST itself, not just raw closes. A plain
+ * NaN-aware, so a warm-up-padded series can be fed straight in. A plain
  * running sum is poisoned permanently by a single NaN (subtracting it back out
  * when it leaves the window doesn't clear it), so the holes are counted
  * separately and the sum only ever accumulates finite values. Like Pine, a
@@ -48,11 +44,10 @@ export function smaSeries(values: number[], period: number): number[] {
 
 /**
  * `ta.rma` — Wilder's smoothing, `alpha = 1 / period`, seeded with the SMA of
- * the first `period` FINITE values. The base for both RSI and ATR.
+ * the first `period` FINITE values. The base for ATR.
  *
- * Finite, not the first `period` indices: series fed through here (the up/down
- * moves behind RSI) start with an na from `ta.change`, and Pine seeds past it
- * rather than on it.
+ * Finite, not the first `period` indices: Pine seeds past a leading na rather
+ * than on it.
  */
 export function rmaSeries(values: number[], period: number): number[] {
   const out = new Array<number>(values.length).fill(NaN);
@@ -112,6 +107,89 @@ export function emaSeries(values: number[], period: number): number[] {
   return out;
 }
 
+/**
+ * `ta.tr` — true range. `handleNa` is Pine's own argument: `tr(true)` falls
+ * back to `high - low` on the first bar, `ta.tr` (i.e. `tr(false)`) leaves it
+ * na. ATR is built on the first, as in Pine.
+ */
+function trueRangeSeries(
+  highs: number[],
+  lows: number[],
+  closes: number[],
+  handleNa = true,
+): number[] {
+  const out = new Array<number>(highs.length).fill(NaN);
+  for (let i = 0; i < highs.length; i++) {
+    if (i === 0) {
+      if (handleNa) out[i] = highs[i] - lows[i];
+      continue;
+    }
+    out[i] = Math.max(
+      highs[i] - lows[i],
+      Math.abs(highs[i] - closes[i - 1]),
+      Math.abs(lows[i] - closes[i - 1]),
+    );
+  }
+  return out;
+}
+
+/** `ta.atr` — RMA of the true range. */
+export function atrSeries(
+  highs: number[],
+  lows: number[],
+  closes: number[],
+  period: number,
+): number[] {
+  return rmaSeries(trueRangeSeries(highs, lows, closes), period);
+}
+
+export interface DmiSeries {
+  plusDi: number[];
+  minusDi: number[];
+  adx: number[];
+}
+
+/**
+ * `ta.dmi` — Wilder's directional movement: +DI, −DI and ADX. Built on
+ * `ta.tr` without the first-bar fallback, as Pine's own source does, so the
+ * seed lands where TradingView's does.
+ */
+export function dmiSeries(
+  highs: number[],
+  lows: number[],
+  closes: number[],
+  diLength: number,
+  adxSmoothing: number,
+): DmiSeries {
+  const n = highs.length;
+  const plusDm = new Array<number>(n).fill(NaN);
+  const minusDm = new Array<number>(n).fill(NaN);
+  for (let i = 1; i < n; i++) {
+    const up = highs[i] - highs[i - 1];
+    const down = lows[i - 1] - lows[i];
+    plusDm[i] = up > down && up > 0 ? up : 0;
+    minusDm[i] = down > up && down > 0 ? down : 0;
+  }
+
+  const trur = rmaSeries(trueRangeSeries(highs, lows, closes, false), diLength);
+  const plusSmoothed = rmaSeries(plusDm, diLength);
+  const minusSmoothed = rmaSeries(minusDm, diLength);
+
+  const plusDi = new Array<number>(n).fill(NaN);
+  const minusDi = new Array<number>(n).fill(NaN);
+  const spread = new Array<number>(n).fill(NaN);
+  for (let i = 0; i < n; i++) {
+    if (!(trur[i] > 0)) continue;
+    plusDi[i] = (100 * plusSmoothed[i]) / trur[i];
+    minusDi[i] = (100 * minusSmoothed[i]) / trur[i];
+    const sum = plusDi[i] + minusDi[i];
+    spread[i] = Math.abs(plusDi[i] - minusDi[i]) / (sum === 0 ? 1 : sum);
+  }
+
+  const adx = rmaSeries(spread, adxSmoothing).map((v) => 100 * v);
+  return { plusDi, minusDi, adx };
+}
+
 /** `ta.roc` — rate of change in percent: `100 * (v - v[n]) / v[n]`. */
 export function rocSeries(values: number[], period: number): number[] {
   const out = new Array<number>(values.length).fill(NaN);
@@ -145,139 +223,9 @@ export function rsiSeries(values: number[], period: number): number[] {
     const up = avgGain[i];
     const down = avgLoss[i];
     if (!Number.isFinite(up) || !Number.isFinite(down)) continue;
-    // Pine's own edge cases, kept verbatim: a period with no losses is 100,
-    // one with no gains is 0, rather than a division by zero.
+    // Pine's own edge cases: no losses is 100, no gains is 0.
     out[i] = down === 0 ? 100 : up === 0 ? 0 : 100 - 100 / (1 + up / down);
   }
-  return out;
-}
-
-/**
- * `ta.stoch(src, high, low, period)` — where the source sits inside the
- * highest/lowest range of the window. Flat window means no range and no
- * verdict, so NaN rather than a divide by zero.
- */
-export function stochSeries(
-  src: number[],
-  highs: number[],
-  lows: number[],
-  period: number,
-): number[] {
-  const out = new Array<number>(src.length).fill(NaN);
-
-  for (let i = period - 1; i < src.length; i++) {
-    let highest = -Infinity;
-    let lowest = Infinity;
-    let complete = true;
-
-    for (let j = i - period + 1; j <= i; j++) {
-      if (!Number.isFinite(highs[j]) || !Number.isFinite(lows[j])) {
-        complete = false;
-        break;
-      }
-      if (highs[j] > highest) highest = highs[j];
-      if (lows[j] < lowest) lowest = lows[j];
-    }
-
-    if (!complete || !Number.isFinite(src[i])) continue;
-    const range = highest - lowest;
-    if (range !== 0) out[i] = ((src[i] - lowest) / range) * 100;
-  }
-
-  return out;
-}
-
-/** `ta.tr(true)` — true range, falling back to `high - low` on the first bar. */
-function trueRangeSeries(
-  highs: number[],
-  lows: number[],
-  closes: number[],
-): number[] {
-  const out = new Array<number>(highs.length).fill(NaN);
-  for (let i = 0; i < highs.length; i++) {
-    if (i === 0) {
-      out[i] = highs[i] - lows[i];
-      continue;
-    }
-    out[i] = Math.max(
-      highs[i] - lows[i],
-      Math.abs(highs[i] - closes[i - 1]),
-      Math.abs(lows[i] - closes[i - 1]),
-    );
-  }
-  return out;
-}
-
-/** `ta.atr` — RMA of the true range. */
-export function atrSeries(
-  highs: number[],
-  lows: number[],
-  closes: number[],
-  period: number,
-): number[] {
-  return rmaSeries(trueRangeSeries(highs, lows, closes), period);
-}
-
-/**
- * Bollinger bandwidth, normalised by the basis so it is comparable across
- * price levels: `(upper - lower) / basis * 100`, band half-width `mult * stdev`.
- */
-export function bandwidthSeries(
-  closes: number[],
-  period: number,
-  mult: number,
-): number[] {
-  const means = smaSeries(closes, period);
-  const out = new Array<number>(closes.length).fill(NaN);
-
-  for (let i = period - 1; i < closes.length; i++) {
-    const mean = means[i];
-    if (!Number.isFinite(mean) || mean === 0) continue;
-
-    // Two-pass variance on purpose. A squeeze *is* a tiny variance around a
-    // large mean, which is precisely where the E[x²]-E[x]² shortcut loses its
-    // significant digits to float64 cancellation.
-    let sumSquares = 0;
-    for (let j = i - period + 1; j <= i; j++) {
-      const deviation = closes[j] - mean;
-      sumSquares += deviation * deviation;
-    }
-    const stdev = Math.sqrt(sumSquares / period); // divide by N, as ta.stdev does
-
-    out[i] = ((2 * mult * stdev) / mean) * 100;
-  }
-
-  return out;
-}
-
-/**
- * `ta.percentrank` — the share of the PREVIOUS `lookback` values that are less
- * than or equal to the current one. The current bar is excluded from its own
- * window, so a reading of 20 means only a fifth of recent bars were tighter.
- */
-export function percentRankSeries(
-  values: number[],
-  lookback: number,
-): number[] {
-  const out = new Array<number>(values.length).fill(NaN);
-
-  for (let i = lookback; i < values.length; i++) {
-    const current = values[i];
-    if (!Number.isFinite(current)) continue;
-
-    let count = 0;
-    let complete = true;
-    for (let j = i - lookback; j < i; j++) {
-      if (!Number.isFinite(values[j])) {
-        complete = false;
-        break;
-      }
-      if (values[j] <= current) count++;
-    }
-
-    if (complete) out[i] = (count / lookback) * 100;
-  }
-
   return out;
 }
 
@@ -289,14 +237,10 @@ export interface CrossInfo {
 
 /**
  * The most recent `ta.crossover`/`ta.crossunder` of `a` through `b` at or
- * before bar `at`. Taking `at` as a parameter is what lets the indicator clock
- * ask this question about the live bar while everything else reads a closed one.
+ * before bar `at`. Taking `at` as a parameter lets the indicator clock ask
+ * this about the live bar while price structure reads a closed one.
  */
-export function barsSinceCross(
-  a: number[],
-  b: number[],
-  at: number,
-): CrossInfo {
+export function barsSinceCross(a: number[], b: number[], at: number): CrossInfo {
   for (let i = at; i > 0; i--) {
     const now = a[i] - b[i];
     const before = a[i - 1] - b[i - 1];

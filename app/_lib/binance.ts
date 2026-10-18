@@ -151,8 +151,7 @@ const klinesCache = new Map<string, { data: any[]; expiresAt: number }>();
  * `ttlMs` is the caller's call because it depends on WHICH candle they read.
  * A scanner that only judges CLOSED candles can hold a series until the next
  * close and spend nothing in between. One that reads the LIVE, still-forming
- * candle — as the KST scanner does, to match TradingView — must use a short
- * TTL instead, or its indicators freeze at whatever they happened to be when
+ * candle must use a short TTL instead, or its indicators freeze at whatever they happened to be when
  * the hour turned.
  */
 export async function getKlines(
@@ -186,4 +185,44 @@ export function klinesNeedNetwork(
 ): boolean {
   const cached = klinesCache.get(`${symbol}:${interval}:${limit}`);
   return !cached || Date.now() >= cached.expiresAt;
+}
+
+// OI snapshots, one per period, stamped on the period boundary: the point at T
+// is the open interest at the close of the candle that ends at T.
+const oiCache = new Map<string, { data: number | null; expiresAt: number }>();
+const OI_MISS_RETRY_MS = 60_000;
+
+/**
+ * % change in open interest over `bars` candles of `period` ending at `closedAt` (a
+ * candle-close boundary). Null when either snapshot is missing. Held until the
+ * caller's TTL — the next close — like the klines.
+ */
+export async function getOpenInterestChange(
+  symbol: string,
+  period: string,
+  periodMs: number,
+  closedAt: number,
+  bars: number,
+  ttlMs: number,
+): Promise<number | null> {
+  const key = `${symbol}:${period}:${closedAt}:${bars}`;
+  const cached = oiCache.get(key);
+  if (cached && Date.now() < cached.expiresAt) return cached.data;
+
+  const rows: any[] = await binanceFetch(
+    `https://fapi.binance.com/futures/data/openInterestHist?symbol=${symbol}&period=${period}&limit=${bars + 2}`,
+  );
+  const at = (t: number) =>
+    parseFloat(rows.find((r) => r.timestamp === t)?.sumOpenInterest ?? "NaN");
+  const now = at(closedAt);
+  const then = at(closedAt - bars * periodMs);
+  const data =
+    Number.isFinite(now) && then > 0 ? ((now - then) / then) * 100 : null;
+
+  // The snapshot at `closedAt` can lag the candle close by a little. Holding a
+  // miss until the next close would blank a daily scanner for a whole day, so
+  // misses are retried after a minute.
+  const holdMs = data == null ? Math.min(ttlMs, OI_MISS_RETRY_MS) : ttlMs;
+  oiCache.set(key, { data, expiresAt: Date.now() + holdMs });
+  return data;
 }

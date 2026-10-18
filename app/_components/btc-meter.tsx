@@ -24,7 +24,7 @@ import {
 } from "../_lib/btc-momentum";
 
 interface Breadth {
-  above: number;
+  bull: number;
   total: number;
   percent: number;
 }
@@ -158,7 +158,7 @@ export default function BtcMeter({
         `trend ${momentum.trendScore.toFixed(2)} · range position ${momentum.rangePosition.toFixed(0)}% · candles ${momentum.bodyScore.toFixed(2)}`,
         `${momentum.greenBars} up / ${momentum.redBars} down of ${momentum.bars} 1h bars`,
         breadth
-          ? `${breadth.above} of ${breadth.total} scanned pairs above their EMA 50`
+          ? `${breadth.bull} of ${breadth.total} scanned pairs closed above their EMA 50`
           : "",
       ]
         .filter(Boolean)
@@ -365,7 +365,7 @@ export default function BtcMeter({
       {/* Breadth — the half of the regime BTC's own candles cannot report */}
       <div className="border-t border-gray-800 pt-2">
         <Row
-          label="Alts above EMA 50"
+          label="Alts fanned bullish"
           value={
             <span className={breadthTone.text}>
               {breadth ? `${breadth.percent.toFixed(0)}%` : "—"}

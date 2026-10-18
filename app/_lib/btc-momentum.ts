@@ -1,17 +1,19 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
-// BTCUSDT.P momentum leveler — the regime read the two tables don't give you.
+// BTCUSDT.P momentum leveler — the regime read the watchlist doesn't give you.
 //
-// A 1h KST pullback long into a week of BTC bleeding is a different trade from
-// the same setup with BTC grinding up, so this sits above the tables as
+// A pullback long into a week of BTC bleeding is a different trade from
+// the same setup with BTC grinding up, so this sits above the table as
 // context: where BTC's last MOMENTUM_DAYS have left it, rendered as a spirit
 // level. Flat is neutral, nose up is bullish, nose down bearish. It gates
-// nothing and filters nothing — same standing as RVOL and the squeeze badge.
+// nothing and filters nothing — same standing as any other read-out.
 //
-// Read on 1h candles, like everything else on this page. The window is still a
-// week; it is measured in 168 hourly bars rather than 7 daily ones. That
-// matters for two reasons: the bars line up with the chart the signals are
-// taken from, and a daily series only moves once a day — on an hourly refresh
-// it would hand back the same reading 23 times out of 24.
+// Read on 1h candles — the card keeps its own clock, independent of whatever
+// timeframe the scanner is on. The window is a week measured in 168 hourly
+// bars rather than 7 daily ones, because a daily series only moves once a day
+// and would hand back the same reading 23 times out of 24. It happens to share
+// the scanner's 1h clock today, but it would not follow the scanner up to 4h:
+// a week is only 42 of those, too coarse a sample for the position and body
+// legs to say much.
 //
 // Three legs, because each one alone lies in a way the others catch:
 //
@@ -30,9 +32,8 @@
 // followed by +0.10% over the next 24h and BEARISH by −0.13%, against a 2%
 // daily sd. Read it as orientation, never as a direction call.
 //
-// Like the scanner's indicators this reads the LIVE, still-forming 1h candle.
-// Only ATR comes off the last CLOSED bar, because a partial bar's true range
-// would read as a volatility collapse for most of every hour.
+// Like the scanner, this reads CLOSED 1h candles only — the forming candle is
+// dropped in `evaluateBtcMomentum`, so the card holds until the next close.
 
 import { getKlines } from "./binance";
 import { atrSeries } from "./indicators";
@@ -80,7 +81,7 @@ export const MAX_TILT_DEG = 32;
 export type BtcVerdict = "BULLISH" | "NEUTRAL" | "BEARISH";
 
 export interface BtcMomentum {
-  /** Live price — the forming 1h candle's close. The needle's right end. */
+  /** The last closed 1h candle's close. The needle's right end. */
   price: number;
   /** Where the window opened: the close MOMENTUM_BARS bars back, and the
    *  needle's left end. The two together are what the tilt is measuring. */
@@ -115,10 +116,9 @@ const clamp = (value: number, lo: number, hi: number) =>
   Math.min(hi, Math.max(lo, value));
 
 /**
- * `ttlMs` is the caller's, exactly as in getKlines. The page passes the same
- * one-scan-per-1h-candle TTL it gives the scanner, so the card is re-sampled
- * moments after each hourly close and held for the hour — one rule for the
- * whole page.
+ * `ttlMs` is the caller's, exactly as in getKlines. The page passes an
+ * until-the-next-1h-close TTL — its own clock, independent of the scanner's —
+ * so the first read after each hourly close lands moments after it.
  */
 export async function getBtcMomentum(
   ttlMs: number,
@@ -153,10 +153,9 @@ interface Legs {
   redBars: number;
 }
 
-/** The composite as of bar `i`, treating `i` as the live bar. */
+/** The composite as of closed bar `i`. */
 function legsAt(i: number, s: Series): Legs | null {
   const start = i - MOMENTUM_BARS + 1;
-  const prev = i - 1;
   if (start < 1) return null;
 
   const price = s.closes[i];
@@ -165,7 +164,7 @@ function legsAt(i: number, s: Series): Legs | null {
 
   // ── Trend: the net move, priced against what a week normally does to BTC ──
   const changePercent = ((price - reference) / reference) * 100;
-  const barAtrPercent = (s.atr[prev] / s.closes[prev]) * 100;
+  const barAtrPercent = (s.atr[i] / s.closes[i]) * 100;
   // Ranges compound as sqrt(N) under a random walk, so this is roughly the move
   // a directionless week produces on its own. Full tilt is one of those.
   const trendScale = barAtrPercent * Math.sqrt(MOMENTUM_BARS);
@@ -236,9 +235,11 @@ function nextVerdict(prev: BtcVerdict, score: number): BtcVerdict {
   return "NEUTRAL";
 }
 
-export function evaluateBtcMomentum(klines: any[]): BtcMomentum | null {
-  const live = klines.length - 1;
-  if (live < MOMENTUM_BARS + ATR_LENGTH) return null;
+export function evaluateBtcMomentum(allKlines: any[]): BtcMomentum | null {
+  // Drop the forming candle (always last); everything below is closed bars.
+  const klines = allKlines.slice(0, -1);
+  const last = klines.length - 1;
+  if (last < MOMENTUM_BARS + ATR_LENGTH) return null;
 
   const highs = klines.map((k: any) => parseFloat(k[2]));
   const lows = klines.map((k: any) => parseFloat(k[3]));
@@ -256,12 +257,12 @@ export function evaluateBtcMomentum(klines: any[]): BtcMomentum | null {
   // state machine is cold-started NEUTRAL HISTORY_BARS ago and walked to now.
   // Any excursion past ENTER_BAND inside the window pins it, which makes the
   // result path-independent except in a stretch that never once leaned.
-  const oldest = Math.max(MOMENTUM_BARS, live - HISTORY_BARS + 1);
+  const oldest = Math.max(MOMENTUM_BARS, last - HISTORY_BARS + 1);
   const history: number[] = [];
   let verdict: BtcVerdict = "NEUTRAL";
   let current: Legs | null = null;
 
-  for (let i = oldest; i <= live; i++) {
+  for (let i = oldest; i <= last; i++) {
     const legs = legsAt(i, series);
     if (!legs) continue;
     history.push(legs.score);
@@ -274,7 +275,7 @@ export function evaluateBtcMomentum(klines: any[]): BtcMomentum | null {
   const dayAgo = history[history.length - 1 - BARS_PER_DAY];
 
   return {
-    price: closes[live],
+    price: closes[last],
     referencePrice: current.reference,
     changePercent: current.changePercent,
     score: current.score,
