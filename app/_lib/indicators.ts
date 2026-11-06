@@ -143,53 +143,6 @@ export function atrSeries(
   return rmaSeries(trueRangeSeries(highs, lows, closes), period);
 }
 
-export interface DmiSeries {
-  plusDi: number[];
-  minusDi: number[];
-  adx: number[];
-}
-
-/**
- * `ta.dmi` — Wilder's directional movement: +DI, −DI and ADX. Built on
- * `ta.tr` without the first-bar fallback, as Pine's own source does, so the
- * seed lands where TradingView's does.
- */
-export function dmiSeries(
-  highs: number[],
-  lows: number[],
-  closes: number[],
-  diLength: number,
-  adxSmoothing: number,
-): DmiSeries {
-  const n = highs.length;
-  const plusDm = new Array<number>(n).fill(NaN);
-  const minusDm = new Array<number>(n).fill(NaN);
-  for (let i = 1; i < n; i++) {
-    const up = highs[i] - highs[i - 1];
-    const down = lows[i - 1] - lows[i];
-    plusDm[i] = up > down && up > 0 ? up : 0;
-    minusDm[i] = down > up && down > 0 ? down : 0;
-  }
-
-  const trur = rmaSeries(trueRangeSeries(highs, lows, closes, false), diLength);
-  const plusSmoothed = rmaSeries(plusDm, diLength);
-  const minusSmoothed = rmaSeries(minusDm, diLength);
-
-  const plusDi = new Array<number>(n).fill(NaN);
-  const minusDi = new Array<number>(n).fill(NaN);
-  const spread = new Array<number>(n).fill(NaN);
-  for (let i = 0; i < n; i++) {
-    if (!(trur[i] > 0)) continue;
-    plusDi[i] = (100 * plusSmoothed[i]) / trur[i];
-    minusDi[i] = (100 * minusSmoothed[i]) / trur[i];
-    const sum = plusDi[i] + minusDi[i];
-    spread[i] = Math.abs(plusDi[i] - minusDi[i]) / (sum === 0 ? 1 : sum);
-  }
-
-  const adx = rmaSeries(spread, adxSmoothing).map((v) => 100 * v);
-  return { plusDi, minusDi, adx };
-}
-
 /** `ta.roc` — rate of change in percent: `100 * (v - v[n]) / v[n]`. */
 export function rocSeries(values: number[], period: number): number[] {
   const out = new Array<number>(values.length).fill(NaN);

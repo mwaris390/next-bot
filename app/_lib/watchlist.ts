@@ -1,21 +1,27 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
-// EMA proximity + confluence scanner, on INTERVAL (1h) candles.
+// EMA + KST + RSI trend-pullback scanner, on INTERVAL (30m) candles.
 //
-//  ONE GATE — the last closed candle's close sits within NEAR_ATR × ATR of
-//  EMA 50 or EMA 200, either side of it. Nothing else filters.
+// Four criteria, all read off the last closed candle:
 //
-//  Everything that passed is then RANKED by how many of five confirmations
-//  the previous (last closed) candle prints for its side:
+//   KST CROSS — KST crossed its signal within the last KST_CROSS_BARS closed
+//               candles, and that is still the latest cross. Up = long,
+//               down = short.
+//   EMA TREND — EMA 50 above EMA 200 (long) / below it (short): the trend the
+//               trade leans on.
+//   RSI       — RSI sits in the neutral band: room to run, not yet stretched.
+//   NEAR EMA  — the close is within NEAR_ATR × ATR of EMA 50 or EMA 200, so
+//               the entry is on the line, not after the move.
 //
-//    KST CROSS  — KST crossed its signal on that candle (up = long, down = short)
-//    RSI        — RSI rose on it (long) / fell on it (short)
-//    ADX        — ADX rose on it: the trend, whichever way, is strengthening
-//    OI         — open interest rose over it: new positions opening (fetched
-//                 by the page, see ./binance)
-//    ENGULF     — a bullish (long) / bearish (short) engulfing candle
+// A coin's side is the recent KST cross when there is one, otherwise the
+// direction its EMAs are stacked in. The page puts coins meeting all four in
+// the first table. The second lists the coins where KST and the EMAs disagree:
+// a fresh KST cross against the EMA stack, or a fresh EMA 50/200 cross with
+// KST on the other side of its signal (see `conflict`).
 //
-//  Short is the exact mirror of long. ADX and OI are directionless, so they
-//  count for whichever side the directional three pick.
+// Volume and volatility are filters here, not ranking hints: a coin has to be
+// liquid and actually moving (against the scan's own median ATR%) to be shown
+// at all, because the quiet ones that tick every box are the ones drifting
+// sideways. That cut is made by the page, which has the median.
 //
 // ─────────────────────────── ONE CLOCK ───────────────────────────
 // Everything reads the LAST CLOSED candle, so a reading is final and holds
@@ -25,7 +31,6 @@
 import {
   atrSeries,
   barsSinceCross,
-  dmiSeries,
   emaSeries,
   rocSeries,
   rsiSeries,
@@ -34,13 +39,17 @@ import {
 
 // ─────────────────────────── PARAMETERS ───────────────────────────
 
-/** The scanner's timeframe. Every indicator and OI read it. */
-export const INTERVAL = "1h";
-export const CANDLE_MS = 60 * 60_000;
-export const INTERVAL_LABEL = "1H";
+/** The scanner's timeframe. */
+export const INTERVAL = "30m";
+export const CANDLE_MS = 30 * 60_000;
+export const INTERVAL_LABEL = "30M";
 
-export const EMAS = [50, 200] as const;
+export const EMA_FAST = 50;
+export const EMA_SLOW = 200;
+export const EMAS = [EMA_FAST, EMA_SLOW] as const;
 export type EmaLength = (typeof EMAS)[number];
+
+/** ATR is only a ruler here — for "near" and for the volatility filter. */
 export const ATR_LENGTH = 14;
 /** "Near" an EMA: the closed candle's close within this many ATRs of it. */
 export const NEAR_ATR = 1.0;
@@ -49,33 +58,29 @@ export const NEAR_ATR = 1.0;
 export const KST_ROC = [8, 12, 18, 24] as const;
 export const KST_SMA = [8, 8, 8, 12] as const;
 export const KST_SIGNAL = 7;
+/** A cross counts if it landed on one of the last this-many closed candles. */
+export const KST_CROSS_BARS = 5;
+/**
+ * An EMA 50/200 cross counts as fresh within this many closed candles, so the
+ * badge tops out at "9c ago". Older than that the cross is history, not a
+ * signal, and isn't flagged.
+ */
+export const EMA_CROSS_BARS = 9;
 
 export const RSI_LENGTH = 14;
+/** Neutral RSI band, inclusive. */
+export const RSI_NEUTRAL_LO = 40;
+export const RSI_NEUTRAL_HI = 60;
 
-/** ADX(14, 14) — Wilder's, as TradingView's built-in DMI. */
-export const ADX_LENGTH = 14;
-export const ADX_SMOOTHING = 14;
+/** The four criteria, in column order. */
+export const CRITERIA = ["kst", "ema", "rsi", "near"] as const;
+export type Criterion = (typeof CRITERIA)[number];
 
-/** Open interest change window: the previous candle alone. */
-export const OI_BARS = 1;
-
-/** The five confirmations, in column order. */
-export const CHECKS = ["kst", "rsi", "adx", "oi", "engulf"] as const;
-export type Check = (typeof CHECKS)[number];
-export const MAX_SCORE = CHECKS.length;
-
-/**
- * EMA 200 is the slowest series. A coin listed less than 499 hours ago comes
- * back with its whole history — the same series TradingView seeds from — and
- * only needs enough bars for EMA 200 to exist at all.
- */
+/** Enough bars for EMA 200 to exist at all. */
 export const MIN_CANDLES = 220;
 
-/** 24 × 1h = the 24h window for volume and change, on closed candles only. */
+/** 48 × 30m = the 24h window for volume and change, on closed candles only. */
 export const DAY_BARS = (24 * 60 * 60_000) / CANDLE_MS;
-
-/** Breadth reads the universe against the 1h EMA 50. */
-export const EMA_BREADTH = 50;
 
 export type Side = "LONG" | "SHORT";
 
@@ -86,33 +91,36 @@ export interface EmaTouch {
   distanceAtr: number;
 }
 
-export interface SetupState {
+export interface Reading {
   side: Side;
-  /** Candle confirmations for `side` — OI is added by the page. */
-  checks: Omit<Record<Check, boolean>, "oi">;
+  criteria: Record<Criterion, boolean>;
+  /** Closed candles since the latest KST cross (0 = the last closed one). */
+  kstBarsAgo: number | null;
+  kstCrossSide: Side | null;
+  /** KST above its signal right now (its state, not a fresh cross). */
+  kstAbove: boolean;
+  /** Closed candles since the latest EMA 50/200 cross. */
+  emaCrossBarsAgo: number | null;
+  emaCrossSide: Side | null;
+  /**
+   * The two disagreements the Partial table lists:
+   *  kstVsEma — fresh KST cross, but the EMA stack points the other way
+   *  emaVsKst — fresh EMA 50/200 cross, but KST sits on the other side of its signal
+   */
+  conflict: { kstVsEma: boolean; emaVsKst: boolean };
   kst: number;
   kstSignal: number;
   rsi: number;
-  rsiPrev: number;
-  adx: number;
-  adxPrev: number;
+  ema50: number;
+  ema200: number;
+  /** Both EMAs, nearest to the close first. */
+  touches: EmaTouch[];
   closedPrice: number;
-  /** Close time of the last closed candle, on the candle boundary. */
-  closedAt: number;
   atrPercent: number;
-  /** Quote volume of the last DAY_BARS closed candles — 24h, without the forming one. */
+  /** Quote volume of the last DAY_BARS closed candles. */
   volume24h: number;
   /** Close-to-close % over the last DAY_BARS closed candles. */
   change24h: number;
-  /** The EMAs the close sits near, nearest first. */
-  touches: EmaTouch[];
-}
-
-export interface Evaluation {
-  /** Set only when the close is near EMA 50 or 200. */
-  setup: SetupState | null;
-  atrPercent: number;
-  aboveEma50: boolean;
 }
 
 function kstSeries(closes: number[]): { kst: number[]; signal: number[] } {
@@ -139,29 +147,13 @@ function kstSeries(closes: number[]): { kst: number[]; signal: number[] } {
 }
 
 /**
- * Engulfing on bar `i` against bar `i - 1`: the opposite-coloured previous
- * body is wholly covered by this one. Null when there's no engulf.
+ * Reads the last closed candle of a FULL kline series, as Binance returns it —
+ * the forming candle is dropped here. Null when there isn't enough history.
  */
-function engulfSide(
-  opens: number[],
-  closes: number[],
-  i: number,
-): Side | null {
-  const [o, c, po, pc] = [opens[i], closes[i], opens[i - 1], closes[i - 1]];
-  if (pc < po && c > o && o <= pc && c >= po && c - o > po - pc) return "LONG";
-  if (pc > po && c < o && o >= pc && c <= po && o - c > pc - po) return "SHORT";
-  return null;
-}
-
-/**
- * Evaluates the last closed candle of a FULL kline series, as Binance returns
- * it — the forming candle is dropped here.
- */
-export function evaluateSetup(klines: any[]): Evaluation | null {
+export function evaluate(klines: any[]): Reading | null {
   const bars = klines.slice(0, -1);
   if (bars.length < MIN_CANDLES) return null;
 
-  const opens = bars.map((k: any) => parseFloat(k[1]));
   const highs = bars.map((k: any) => parseFloat(k[2]));
   const lows = bars.map((k: any) => parseFloat(k[3]));
   const closes = bars.map((k: any) => parseFloat(k[4]));
@@ -173,80 +165,70 @@ export function evaluateSetup(klines: any[]): Evaluation | null {
     .reduce((sum: number, k: any) => sum + parseFloat(k[7]), 0);
   const dayAgo = closes[last - DAY_BARS];
 
-  const emaValues = EMAS.map((length) => emaSeries(closes, length)[last]);
-  const [ema50] = emaValues;
+  const ema50All = emaSeries(closes, EMA_FAST);
+  const ema200All = emaSeries(closes, EMA_SLOW);
+  const ema50 = ema50All[last];
+  const ema200 = ema200All[last];
   const atr = atrSeries(highs, lows, closes, ATR_LENGTH)[last];
-  if (![...emaValues, atr].every(Number.isFinite) || atr <= 0) return null;
-
-  const atrPercent = (atr / closedPrice) * 100;
-  const evaluation: Evaluation = {
-    setup: null,
-    atrPercent,
-    aboveEma50: closedPrice > ema50,
-  };
-
-  // The gate: near EMA 50 or 200, on either side of it.
-  const touches = EMAS.map((length, i) => ({
-    length,
-    value: emaValues[i],
-    distanceAtr: (closedPrice - emaValues[i]) / atr,
-  }))
-    .filter(({ distanceAtr }) => Math.abs(distanceAtr) <= NEAR_ATR)
-    .sort((a, b) => Math.abs(a.distanceAtr) - Math.abs(b.distanceAtr));
-  if (touches.length === 0) return evaluation;
-
-  const rsiAll = rsiSeries(closes, RSI_LENGTH);
-  const { adx: adxAll } = dmiSeries(highs, lows, closes, ADX_LENGTH, ADX_SMOOTHING);
+  const rsi = rsiSeries(closes, RSI_LENGTH)[last];
   const { kst, signal } = kstSeries(closes);
-  const [rsi, rsiPrev, adx, adxPrev] = [
-    rsiAll[last],
-    rsiAll[last - 1],
-    adxAll[last],
-    adxAll[last - 1],
-  ];
-  if (![rsi, rsiPrev, adx, adxPrev].every(Number.isFinite)) return evaluation;
+  if (
+    ![ema50, ema200, atr, rsi, kst[last], signal[last]].every(Number.isFinite) ||
+    atr <= 0
+  ) {
+    return null;
+  }
 
-  // The three directional reads, each voting for a side (or abstaining).
   const cross = barsSinceCross(kst, signal, last);
-  const kstSide: Side | null =
-    cross.barsSince === 0 ? (cross.side === "UP" ? "LONG" : "SHORT") : null;
-  const rsiSide: Side | null =
-    rsi > rsiPrev ? "LONG" : rsi < rsiPrev ? "SHORT" : null;
-  const engulf = engulfSide(opens, closes, last);
+  const kstCrossSide: Side | null =
+    cross.side === "UP" ? "LONG" : cross.side === "DOWN" ? "SHORT" : null;
+  const recentCross =
+    cross.barsSince != null && cross.barsSince < KST_CROSS_BARS;
 
-  // Side = the majority of those votes. A split (KST one way, RSI the other)
-  // goes to the stronger signal: KST cross, then engulfing, then RSI.
-  const votes = [kstSide, engulf, rsiSide];
-  const longs = votes.filter((v) => v === "LONG").length;
-  const shorts = votes.filter((v) => v === "SHORT").length;
-  const side: Side | null =
-    longs > shorts
-      ? "LONG"
-      : shorts > longs
-        ? "SHORT"
-        : (votes.find((v) => v != null) ?? null);
-  if (!side) return evaluation;
+  const emaSide: Side = ema50 >= ema200 ? "LONG" : "SHORT";
+  const kstAbove = kst[last] > signal[last];
 
-  evaluation.setup = {
+  const emaCross = barsSinceCross(ema50All, ema200All, last);
+  const emaCrossSide: Side | null =
+    emaCross.side === "UP" ? "LONG" : emaCross.side === "DOWN" ? "SHORT" : null;
+  const recentEmaCross =
+    emaCross.barsSince != null && emaCross.barsSince < EMA_CROSS_BARS;
+  const side: Side = recentCross && kstCrossSide ? kstCrossSide : emaSide;
+
+  const touches = EMAS.map((length, i) => {
+    const value = i === 0 ? ema50 : ema200;
+    return { length, value, distanceAtr: (closedPrice - value) / atr };
+  }).sort((a, b) => Math.abs(a.distanceAtr) - Math.abs(b.distanceAtr));
+
+  return {
     side,
-    checks: {
-      kst: kstSide === side,
-      rsi: rsiSide === side,
-      adx: adx > adxPrev,
-      engulf: engulf === side,
+    criteria: {
+      kst: recentCross && kstCrossSide === side,
+      ema: emaSide === side,
+      rsi: rsi >= RSI_NEUTRAL_LO && rsi <= RSI_NEUTRAL_HI,
+      near: Math.abs(touches[0].distanceAtr) <= NEAR_ATR,
+    },
+    kstBarsAgo: cross.barsSince,
+    kstCrossSide,
+    kstAbove,
+    emaCrossBarsAgo: emaCross.barsSince,
+    emaCrossSide,
+    conflict: {
+      kstVsEma: recentCross && kstCrossSide != null && kstCrossSide !== emaSide,
+      emaVsKst:
+        recentEmaCross &&
+        emaCrossSide != null &&
+        (emaCrossSide === "LONG") !== kstAbove,
     },
     kst: kst[last],
     kstSignal: signal[last],
     rsi,
-    rsiPrev,
-    adx,
-    adxPrev,
+    ema50,
+    ema200,
+    touches,
     closedPrice,
-    closedAt: bars[last][6] + 1,
-    atrPercent,
+    atrPercent: (atr / closedPrice) * 100,
     volume24h,
     change24h: ((closedPrice - dayAgo) / dayAgo) * 100,
-    touches,
   };
-  return evaluation;
 }

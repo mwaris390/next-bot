@@ -1,13 +1,12 @@
 import { unstable_rethrow } from "next/navigation";
 import AutoRefresh from "./_components/auto-refresh";
 import BtcMeter from "./_components/btc-meter";
+import MarketBias, { type MarketStats } from "./_components/market-bias";
 import {
   CANDLE_CACHE_GRACE_MS,
-  MIN_VOLUME,
   RateLimitedError,
   getFilteredPairs,
   getKlines,
-  getOpenInterestChange,
   isNearWeightCap,
   isPastWeightSoftCap,
   isThrottled,
@@ -17,26 +16,31 @@ import {
 } from "./_lib/binance";
 import { type BtcMomentum, getBtcMomentum } from "./_lib/btc-momentum";
 import {
-  ADX_LENGTH,
   ATR_LENGTH,
   CANDLE_MS,
-  type Check,
-  EMA_BREADTH,
-  type EmaTouch,
+  CRITERIA,
+  type Criterion,
+  EMA_FAST,
+  EMA_SLOW,
   INTERVAL,
   INTERVAL_LABEL,
+  EMA_CROSS_BARS,
+  KST_CROSS_BARS,
   KST_ROC,
   KST_SIGNAL,
   KST_SMA,
-  MAX_SCORE,
   NEAR_ATR,
-  OI_BARS,
   RSI_LENGTH,
+  RSI_NEUTRAL_HI,
+  RSI_NEUTRAL_LO,
+  type Reading,
   type Side,
-  evaluateSetup,
+  evaluate,
 } from "./_lib/watchlist";
 import {
   type Tradability,
+  VOL_GOOD_LO,
+  VOL_WILD,
   formatVolume,
   median,
   tradability,
@@ -44,7 +48,7 @@ import {
 
 // 499, not 500, on purpose: Binance buckets klines request-weight by `limit`
 // ([100,500) costs 2, [500,1000) costs 5), so one bar less is 2.5x cheaper.
-// Enough for EMA 200 / RSI / ADX / KST to settle to TradingView's values.
+// Enough for EMA 200 / RSI / KST to settle to TradingView's values.
 const KLINE_LIMIT = 499;
 
 // One clock: everything reads the last CLOSED candle (see ./_lib/watchlist),
@@ -62,60 +66,40 @@ const BATCH_DELAY_MS = 120;
 
 const DISPLAY_LIMIT = 50;
 
+// ─────────────── Trend filter: liquid AND moving ───────────────
+// Quiet coins tick the boxes too — RSI sits at 50 and price hugs the EMAs
+// precisely because nothing is happening. These cut them before either table.
+/** 24h quote volume floor, on closed candles. */
+const SCAN_MIN_VOLUME = 20_000_000;
+/** ATR% must be at least this multiple of the scan median… */
+const MIN_VOL_RATIO = VOL_GOOD_LO;
+/** …and at most this (past it the bars are noise, not trend). */
+const MAX_VOL_RATIO = VOL_WILD;
+
 // ==================== Scan ====================
 
-interface Row {
+type Row = Reading & {
   symbol: string;
-  side: Side;
-  changePercent: number;
-  volume: number;
-  atrPercent: number;
-  candleChecks: Omit<Record<Check, boolean>, "oi">;
-  kst: number;
-  kstSignal: number;
-  rsi: number;
-  rsiPrev: number;
-  adx: number;
-  adxPrev: number;
-  touches: EmaTouch[];
-  closedAt: number;
-}
-
-type Ranked = Row & {
-  checks: Record<Check, boolean>;
-  /** OI % change over the previous candle; null when the read failed. */
-  oiChange: number | null;
-  /** Confirmations met, 0–MAX_SCORE. The primary sort key. */
-  score: number;
-  /** Volatility × liquidity — breaks ties between equal scores. */
+  met: number;
   tradability: Tradability;
 };
 
-/** Share of the universe closing above its EMA 50. */
-interface Breadth {
-  bull: number;
-  total: number;
-  percent: number;
-}
-
 interface ScanResult {
-  rows: Ranked[];
-  total: number;
-  longs: number;
-  shorts: number;
-  scanned: number;
-  breadth: Breadth | null;
+  full: Row[];
+  partial: Row[];
+  fullTotal: number;
+  partialTotal: number;
+  filteredOut: number;
+  market: MarketStats;
   medianAtrPercent: number;
+  scanned: number;
   rateLimited: boolean;
   scannedAt: number;
 }
 
 async function scan(): Promise<ScanResult> {
   const pairs = await getFilteredPairs();
-  const rows: Row[] = [];
-  const atrSamples: number[] = [];
-  let breadthBull = 0;
-  let breadthTotal = 0;
+  const readings: { symbol: string; reading: Reading }[] = [];
   let rateLimited = false;
 
   for (let i = 0; i < pairs.length; i += MAX_CONCURRENT) {
@@ -143,7 +127,8 @@ async function scan(): Promise<ScanResult> {
             KLINE_LIMIT,
             candleTtlMs(),
           );
-          return { pair, evaluation: evaluateSetup(klines) };
+          const reading = evaluate(klines);
+          return reading ? { symbol: pair.symbol, reading } : null;
         } catch (error) {
           if (error instanceof RateLimitedError) rateLimited = true;
           else console.log("scan error", pair.symbol, error);
@@ -151,102 +136,72 @@ async function scan(): Promise<ScanResult> {
         }
       }),
     );
-
-    for (const result of results) {
-      if (!result?.evaluation) continue;
-      const { pair, evaluation } = result;
-      breadthTotal += 1;
-      atrSamples.push(evaluation.atrPercent);
-      if (evaluation.aboveEma50) breadthBull += 1;
-      const setup = evaluation.setup;
-      // The ticker's rolling 24h includes the forming candle, so it only picks
-      // which pairs to fetch; the volume floor is re-checked on closed candles.
-      if (setup && setup.volume24h >= MIN_VOLUME) {
-        rows.push({
-          symbol: pair.symbol,
-          side: setup.side,
-          changePercent: setup.change24h,
-          volume: setup.volume24h,
-          atrPercent: setup.atrPercent,
-          candleChecks: setup.checks,
-          kst: setup.kst,
-          kstSignal: setup.kstSignal,
-          rsi: setup.rsi,
-          rsiPrev: setup.rsiPrev,
-          adx: setup.adx,
-          adxPrev: setup.adxPrev,
-          touches: setup.touches,
-          closedAt: setup.closedAt,
-        });
-      }
-    }
+    for (const result of results) if (result) readings.push(result);
 
     if (willHitNetwork && i + MAX_CONCURRENT < pairs.length) {
       await sleep(BATCH_DELAY_MS);
     }
   }
 
-  // Volatility is scored against the whole scan's median, so ranking waits
-  // until every pair has been read.
-  const medianAtrPercent = median(atrSamples);
-
-  // Every near-EMA row gets an OI read — one request each, held until the next
-  // close. OI only ranks, so a failed read just leaves that check unmet.
-  const ranked: Ranked[] = [];
-  for (let i = 0; i < rows.length; i += MAX_CONCURRENT) {
-    const skipOi = isThrottled() || isNearWeightCap();
-    if (skipOi) rateLimited = true;
-    const checked = await Promise.all(
-      rows.slice(i, i + MAX_CONCURRENT).map(async (row) => {
-        const oiChange = skipOi
-          ? null
-          : await getOpenInterestChange(
-              row.symbol,
-              INTERVAL,
-              CANDLE_MS,
-              row.closedAt,
-              OI_BARS,
-              candleTtlMs(),
-            ).catch((error) => {
-              if (error instanceof RateLimitedError) rateLimited = true;
-              else console.log("oi error", row.symbol, error);
-              return null;
-            });
-        return { row, oiChange };
-      }),
-    );
-
-    for (const { row, oiChange } of checked) {
-      const checks = { ...row.candleChecks, oi: oiChange != null && oiChange > 0 };
-      ranked.push({
-        ...row,
-        checks,
-        oiChange,
-        score: Object.values(checks).filter(Boolean).length,
-        tradability: tradability(row.atrPercent, row.volume, medianAtrPercent),
-      });
+  // Market read: the whole universe, before any filter.
+  const market: MarketStats = {
+    total: readings.length,
+    aboveEma50: 0,
+    emaBullStack: 0,
+    kstAbove: 0,
+    kstUp: 0,
+    kstDown: 0,
+  };
+  for (const { reading: r } of readings) {
+    if (r.kstAbove) market.kstAbove += 1;
+    if (r.closedPrice > r.ema50) market.aboveEma50 += 1;
+    if (r.ema50 > r.ema200) market.emaBullStack += 1;
+    if (r.kstBarsAgo != null && r.kstBarsAgo < KST_CROSS_BARS) {
+      if (r.kstCrossSide === "LONG") market.kstUp += 1;
+      else if (r.kstCrossSide === "SHORT") market.kstDown += 1;
     }
   }
 
-  ranked.sort(
-    (a, b) => b.score - a.score || b.tradability.score - a.tradability.score,
-  );
+  // Volatility is judged against the whole scan's median.
+  const medianAtrPercent = median(readings.map(({ reading }) => reading.atrPercent));
+
+  const rows: Row[] = [];
+  let filteredOut = 0;
+  for (const { symbol, reading } of readings) {
+    const t = tradability(reading.atrPercent, reading.volume24h, medianAtrPercent);
+    if (
+      reading.volume24h < SCAN_MIN_VOLUME ||
+      t.volatilityRatio < MIN_VOL_RATIO ||
+      t.volatilityRatio > MAX_VOL_RATIO
+    ) {
+      filteredOut += 1;
+      continue;
+    }
+    const met = CRITERIA.filter((c) => reading.criteria[c]).length;
+    rows.push({ ...reading, symbol, met, tradability: t });
+  }
+
+  const byTradability = (a: Row, b: Row) => b.tradability.score - a.tradability.score;
+  const full = rows.filter((r) => r.met === CRITERIA.length).sort(byTradability);
+  // Partial = KST and the EMAs disagree, one way or the other. Rows that also
+  // meet RSI neutral / near EMA rank first.
+  const partial = rows
+    .filter(
+      (r) =>
+        r.met < CRITERIA.length &&
+        (r.conflict.kstVsEma || r.conflict.emaVsKst),
+    )
+    .sort((a, b) => b.met - a.met || byTradability(a, b));
 
   return {
-    rows: ranked.slice(0, DISPLAY_LIMIT),
-    total: ranked.length,
-    longs: ranked.filter((r) => r.side === "LONG").length,
-    shorts: ranked.filter((r) => r.side === "SHORT").length,
-    scanned: pairs.length,
-    breadth:
-      breadthTotal > 0
-        ? {
-            bull: breadthBull,
-            total: breadthTotal,
-            percent: (breadthBull / breadthTotal) * 100,
-          }
-        : null,
+    full: full.slice(0, DISPLAY_LIMIT),
+    partial: partial.slice(0, DISPLAY_LIMIT),
+    fullTotal: full.length,
+    partialTotal: partial.length,
+    filteredOut,
+    market,
     medianAtrPercent,
+    scanned: pairs.length,
     rateLimited,
     scannedAt: Date.now(),
   };
@@ -272,72 +227,55 @@ function SidePill({ side }: { side: Side }) {
   );
 }
 
-function NearEma({ row }: { row: Row }) {
-  const [nearest, ...rest] = row.touches;
-  return (
-    <span className="inline-flex flex-col gap-0.5 whitespace-nowrap">
-      <span
-        className="font-mono text-sm text-cyan-300"
-        title={`Close is ${Math.abs(nearest.distanceAtr).toFixed(2)} ATR ${
-          nearest.distanceAtr >= 0 ? "above" : "below"
-        } EMA ${nearest.length}`}
-      >
-        EMA {nearest.length}{" "}
-        <span className="text-gray-500">
-          {nearest.distanceAtr >= 0 ? "+" : "−"}
-          {Math.abs(nearest.distanceAtr).toFixed(2)} ATR
-        </span>
-      </span>
-      {rest.length > 0 && (
-        <span className="font-mono text-[11px] text-gray-500">
-          also {rest.map((t) => `EMA ${t.length}`).join(", ")}
-        </span>
-      )}
-    </span>
-  );
-}
+// ─────────────── Badges ───────────────
+// Every class name is spelled out in full: Tailwind only generates CSS for
+// literal strings it finds in the source.
+const TONE = {
+  bull: "bg-emerald-500/15 text-emerald-300",
+  bear: "bg-rose-500/15 text-rose-300",
+  warn: "bg-amber-500/15 text-amber-300",
+  calm: "bg-cyan-500/15 text-cyan-300",
+  muted: "bg-gray-800 text-gray-400",
+} as const;
+type Tone = keyof typeof TONE;
 
-/** One confirmation cell: a tick or a dash, with the reading underneath. */
-function CheckCell({
-  met,
-  detail,
-  title,
+function Badge({
+  tone,
+  met = false,
+  children,
 }: {
-  met: boolean;
-  detail: React.ReactNode;
-  title: string;
+  tone: Tone;
+  /** Outlined when this badge is the reason a criterion passed. */
+  met?: boolean;
+  children: React.ReactNode;
 }) {
   return (
-    <span className="inline-flex flex-col gap-0.5 whitespace-nowrap" title={title}>
-      <span
-        className={`w-fit rounded-md px-2 py-0.5 font-mono text-xs ${
-          met
-            ? "bg-emerald-500/15 font-bold text-emerald-300"
-            : "bg-gray-800 text-gray-500"
-        }`}
-      >
-        {met ? "✓" : "—"}
-      </span>
-      <span className="font-mono text-[11px] text-gray-500">{detail}</span>
+    <span
+      className={`w-fit whitespace-nowrap rounded-full px-2.5 py-0.5 text-xs font-semibold ${TONE[tone]} ${
+        met ? "ring-1 ring-current" : ""
+      }`}
+    >
+      {children}
     </span>
   );
 }
 
-const arrow = (now: number, prev: number) =>
-  `${prev.toFixed(1)} → ${now.toFixed(1)}`;
-
-function ScoreBadge({ row }: { row: Ranked }) {
-  const tone =
-    row.score >= 4
-      ? "text-emerald-300"
-      : row.score >= 3
-        ? "text-cyan-300"
-        : row.score >= 2
-          ? "text-gray-300"
-          : "text-gray-600";
+/** A badge, plus a line of plain detail under it. */
+function Cell({
+  title,
+  children,
+  detail,
+}: {
+  title: string;
+  children: React.ReactNode;
+  detail?: React.ReactNode;
+}) {
   return (
-    <span className={`font-mono text-sm font-bold ${tone}`}>
-      {row.score}/{MAX_SCORE}
+    <span className="inline-flex flex-col gap-1" title={title}>
+      {children}
+      {detail && (
+        <span className="whitespace-nowrap text-[11px] text-gray-500">{detail}</span>
+      )}
     </span>
   );
 }
@@ -353,14 +291,250 @@ function Change({ value }: { value: number }) {
   );
 }
 
+const candlesAgo = (barsAgo: number) =>
+  barsAgo === 0 ? "on the last candle" : `${barsAgo + 1} candles ago`;
+
+const sideTone = (bullish: boolean): Tone => (bullish ? "bull" : "bear");
+
+function KstCell({ r }: { r: Row }) {
+  const recent = r.kstBarsAgo != null && r.kstBarsAgo < KST_CROSS_BARS && r.kstCrossSide;
+  if (recent) {
+    const up = r.kstCrossSide === "LONG";
+    return (
+      <Cell
+        title={`KST crossed ${up ? "above" : "below"} its signal ${candlesAgo(r.kstBarsAgo!)} (counts within ${KST_CROSS_BARS})`}
+        detail={`crossed ${candlesAgo(r.kstBarsAgo!)}`}
+      >
+        <Badge tone={sideTone(up)} met={r.criteria.kst}>
+          {up ? "↑ Bullish cross" : "↓ Bearish cross"}
+        </Badge>
+      </Cell>
+    );
+  }
+  return (
+    <Cell
+      title={`No KST cross in the last ${KST_CROSS_BARS} candles`}
+      detail={
+        r.kstBarsAgo == null ? "no cross on record" : `last cross ${r.kstBarsAgo + 1} candles ago`
+      }
+    >
+      <Badge tone="muted">{r.kstAbove ? "KST above signal" : "KST below signal"}</Badge>
+    </Cell>
+  );
+}
+
+function EmaCell({ r }: { r: Row }) {
+  const bull = r.ema50 >= r.ema200;
+  const freshCross =
+    r.emaCrossBarsAgo != null && r.emaCrossBarsAgo < EMA_CROSS_BARS && r.emaCrossSide;
+  return (
+    <Cell
+      title={`EMA ${EMA_FAST} ${r.ema50.toPrecision(6)} vs EMA ${EMA_SLOW} ${r.ema200.toPrecision(6)}`}
+      detail={`EMA ${EMA_FAST} ${bull ? ">" : "<"} EMA ${EMA_SLOW}`}
+    >
+      <Badge tone={sideTone(bull)} met={r.criteria.ema}>
+        {bull ? "↑ Bullish stack" : "↓ Bearish stack"}
+      </Badge>
+      {freshCross && (
+        <Badge tone="warn">
+          {r.emaCrossSide === "LONG" ? "Golden cross" : "Death cross"} ·{" "}
+          {r.emaCrossBarsAgo === 0 ? "last candle" : `${r.emaCrossBarsAgo! + 1}c ago`}
+        </Badge>
+      )}
+    </Cell>
+  );
+}
+
+function rsiLabel(rsi: number): { label: string; tone: Tone } {
+  if (rsi >= 70) return { label: "Overbought", tone: "warn" };
+  if (rsi > RSI_NEUTRAL_HI) return { label: "Strong", tone: "muted" };
+  if (rsi >= RSI_NEUTRAL_LO) return { label: "Neutral", tone: "calm" };
+  if (rsi > 30) return { label: "Weak", tone: "muted" };
+  return { label: "Oversold", tone: "warn" };
+}
+
+function RsiCell({ r }: { r: Row }) {
+  const { label, tone } = rsiLabel(r.rsi);
+  return (
+    <Cell
+      title={`RSI(${RSI_LENGTH}) — neutral is ${RSI_NEUTRAL_LO}–${RSI_NEUTRAL_HI}`}
+      detail={`RSI ${r.rsi.toFixed(1)}`}
+    >
+      <Badge tone={tone} met={r.criteria.rsi}>
+        {label}
+      </Badge>
+    </Cell>
+  );
+}
+
+function NearCell({ r }: { r: Row }) {
+  const t = r.touches[0];
+  const above = t.distanceAtr >= 0;
+  return (
+    <Cell
+      title={`Near = close within ${NEAR_ATR} ATR(${ATR_LENGTH}) of EMA ${EMA_FAST} or ${EMA_SLOW}`}
+      detail={`${Math.abs(t.distanceAtr).toFixed(2)} ATR ${above ? "above" : "below"}`}
+    >
+      <Badge tone={r.criteria.near ? "calm" : "muted"} met={r.criteria.near}>
+        {r.criteria.near ? `On EMA ${t.length}` : `Away from EMA ${t.length}`}
+      </Badge>
+    </Cell>
+  );
+}
+
+const CRITERION_CELL: Record<Criterion, (props: { r: Row }) => React.ReactNode> = {
+  kst: KstCell,
+  ema: EmaCell,
+  rsi: RsiCell,
+  near: NearCell,
+};
+
+/** What disagrees with what, in words. */
+function ConflictCell({ r }: { r: Row }) {
+  const word = (bull: boolean) => (bull ? "bullish" : "bearish");
+  return (
+    <span className="inline-flex flex-col gap-1.5">
+      {r.conflict.kstVsEma && r.kstCrossSide && r.kstBarsAgo != null && (
+        <Cell
+          title="Fresh KST cross against the EMA 50/200 stack"
+          detail={`KST crossed ${candlesAgo(r.kstBarsAgo)}`}
+        >
+          <Badge tone="warn">
+            KST {word(r.kstCrossSide === "LONG")} vs EMA {word(r.ema50 >= r.ema200)}
+          </Badge>
+        </Cell>
+      )}
+      {r.conflict.emaVsKst && r.emaCrossSide && r.emaCrossBarsAgo != null && (
+        <Cell
+          title="Fresh EMA 50/200 cross with KST on the other side of its signal"
+          detail={`EMAs crossed ${candlesAgo(r.emaCrossBarsAgo)}`}
+        >
+          <Badge tone="warn">
+            {r.emaCrossSide === "LONG" ? "Golden cross" : "Death cross"} vs KST{" "}
+            {word(r.kstAbove)}
+          </Badge>
+        </Cell>
+      )}
+    </span>
+  );
+}
+
+const HEADER: Record<Criterion, string> = {
+  kst: "KST cross",
+  ema: "EMA trend",
+  rsi: "RSI",
+  near: "Price vs EMA",
+};
+
+function SetupTable({
+  title,
+  badgeClass,
+  rows,
+  total,
+  subtitle,
+  empty,
+  showScore,
+}: {
+  title: string;
+  badgeClass: string;
+  rows: Row[];
+  total: number;
+  subtitle: string;
+  empty: string;
+  showScore: boolean;
+}) {
+  const longs = rows.filter((r) => r.side === "LONG").length;
+  const columns = 9 + (showScore ? 1 : 0);
+  return (
+    <div className="bg-gray-900 rounded-3xl shadow-2xl p-8">
+      <div className="mb-6 flex flex-wrap items-baseline gap-x-4 gap-y-2">
+        <h2 className="text-3xl font-semibold text-white">{title}</h2>
+        <span className={`rounded-full px-3 py-1 text-sm font-semibold ${badgeClass}`}>
+          {total}
+        </span>
+        <span className="text-sm text-green-400">{longs} long</span>
+        <span className="text-sm text-red-400">{rows.length - longs} short</span>
+        <p className="text-sm text-gray-500">
+          {subtitle}
+          {total > rows.length ? ` — ${rows.length} of ${total} shown` : ""}
+        </p>
+      </div>
+      <div className="overflow-x-auto">
+        <table className="w-full text-sm">
+          <thead className="text-gray-400 border-b border-gray-700">
+            <tr>
+              <TH>#</TH>
+              <TH>Pair</TH>
+              <TH>Side</TH>
+              {showScore && <TH>Conflict</TH>}
+              {CRITERIA.map((c) => (
+                <TH key={c}>{HEADER[c]}</TH>
+              ))}
+              <TH>ATR%</TH>
+              <TH>24h volume</TH>
+              <TH>24h %</TH>
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map((r, i) => (
+              <tr
+                key={r.symbol}
+                className="border-b border-gray-800 hover:bg-gray-800/70 transition-colors"
+              >
+                <td className="py-4">{i + 1}</td>
+                <td className="py-4 font-semibold">{r.symbol}</td>
+                <td className="py-4">
+                  <SidePill side={r.side} />
+                </td>
+                {showScore && (
+                  <td className="py-4">
+                    <ConflictCell r={r} />
+                  </td>
+                )}
+                {CRITERIA.map((c) => (
+                  <td key={c} className="py-4">
+                    {CRITERION_CELL[c]({ r })}
+                  </td>
+                ))}
+                <td
+                  className="py-4 font-mono text-xs text-gray-300"
+                  title={`ATR(${ATR_LENGTH}) is ${r.tradability.volatilityRatio.toFixed(2)}× the scan median`}
+                >
+                  {r.atrPercent.toFixed(2)}%
+                </td>
+                <td className="py-4 font-mono text-xs text-gray-300">
+                  {formatVolume(r.volume24h)}
+                </td>
+                <td className="py-4">
+                  <Change value={r.change24h} />
+                </td>
+              </tr>
+            ))}
+            {rows.length === 0 && (
+              <tr>
+                <td colSpan={columns} className="py-12 text-center text-gray-500">
+                  {empty}
+                </td>
+              </tr>
+            )}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
 // ==================== Page ====================
 
-export default async function EmaConfluenceScanner() {
+export default async function TrendPullbackScanner() {
   let result: ScanResult;
   let btc: BtcMomentum | null = null;
 
   try {
-    [result, btc] = await Promise.all([scan(), getBtcMomentum(ttlUntilClose(BTC_CANDLE_MS))]);
+    [result, btc] = await Promise.all([
+      scan(),
+      getBtcMomentum(ttlUntilClose(BTC_CANDLE_MS)),
+    ]);
   } catch (error) {
     // Next signals "this route must render dynamically" by throwing — that's
     // control flow, not a scanner failure, so it has to pass straight through.
@@ -376,22 +550,31 @@ export default async function EmaConfluenceScanner() {
     );
   }
 
-  const { rows, total, longs, shorts, scanned, medianAtrPercent } = result;
+  const { market } = result;
+  const breadth =
+    market.total > 0
+      ? {
+          bull: market.aboveEma50,
+          total: market.total,
+          percent: (market.aboveEma50 / market.total) * 100,
+        }
+      : null;
 
   return (
     <div className="min-h-screen bg-gray-950 text-gray-100 p-8">
       <div className="max-w-7xl mx-auto space-y-10">
         <div className="grid items-start gap-6 lg:grid-cols-[16rem_1fr_16rem]">
-          <div className="hidden lg:block" aria-hidden="true" />
+          <div className="flex justify-center lg:justify-start">
+            <MarketBias stats={market} btc={btc} />
+          </div>
 
           <div className="text-center">
             <h1 className="text-5xl font-bold tracking-tight mb-3">
-              Binance Futures {INTERVAL_LABEL} EMA Confluence Scanner
+              Binance Futures {INTERVAL_LABEL} Trend Pullback Scanner
             </h1>
             <p className="text-gray-400">
-              Price near EMA 50 / 200 • ranked by the previous candle&apos;s KST
-              cross, rising RSI, rising ADX, rising open interest and engulfing
-              candle • shorts mirrored
+              Recent KST cross • EMA {EMA_FAST}/{EMA_SLOW} aligned • RSI
+              neutral • price near an EMA • liquid and moving coins only
             </p>
             <p className="mt-2 text-sm text-gray-500">
               Every reading is on the last closed {INTERVAL_LABEL} candle •
@@ -411,140 +594,43 @@ export default async function EmaConfluenceScanner() {
           </div>
 
           <div className="flex justify-center lg:justify-end">
-            <BtcMeter momentum={btc} breadth={result.breadth} />
+            <BtcMeter momentum={btc} breadth={breadth} />
           </div>
         </div>
 
-        <div className="bg-gray-900 rounded-3xl shadow-2xl p-8">
-          <div className="mb-6 flex flex-wrap items-baseline gap-x-4 gap-y-2">
-            <h2 className="text-3xl font-semibold text-white">👀 Near EMA</h2>
-            <span className="rounded-full bg-amber-500/20 px-3 py-1 text-sm font-semibold text-amber-300">
-              {total}
-            </span>
-            <span className="text-sm text-green-400">{longs} long</span>
-            <span className="text-sm text-red-400">{shorts} short</span>
-            <p className="text-sm text-gray-500">
-              Most confirmations first
-              {total > rows.length ? ` — ${rows.length} of ${total} shown` : ""}
-            </p>
-          </div>
-          <div className="overflow-x-auto">
-            <table className="w-full text-sm">
-              <thead className="text-gray-400 border-b border-gray-700">
-                <tr>
-                  <TH>#</TH>
-                  <TH>Pair</TH>
-                  <TH>Side</TH>
-                  <TH>Score</TH>
-                  <TH>Near</TH>
-                  <TH>KST cross</TH>
-                  <TH>RSI</TH>
-                  <TH>ADX</TH>
-                  <TH>OI</TH>
-                  <TH>Engulf</TH>
-                  <TH>ATR%</TH>
-                  <TH>24h volume</TH>
-                  <TH>24h %</TH>
-                </tr>
-              </thead>
-              <tbody>
-                {rows.map((r, i) => {
-                  const up = r.side === "LONG";
-                  return (
-                    <tr
-                      key={r.symbol}
-                      className="border-b border-gray-800 hover:bg-gray-800/70 transition-colors"
-                    >
-                      <td className="py-4">{i + 1}</td>
-                      <td className="py-4 font-semibold">{r.symbol}</td>
-                      <td className="py-4">
-                        <SidePill side={r.side} />
-                      </td>
-                      <td className="py-4">
-                        <ScoreBadge row={r} />
-                      </td>
-                      <td className="py-4">
-                        <NearEma row={r} />
-                      </td>
-                      <td className="py-4">
-                        <CheckCell
-                          met={r.checks.kst}
-                          detail={`${r.kst.toFixed(2)} / ${r.kstSignal.toFixed(2)}`}
-                          title={`KST crossed ${up ? "above" : "below"} its signal on the previous candle`}
-                        />
-                      </td>
-                      <td className="py-4">
-                        <CheckCell
-                          met={r.checks.rsi}
-                          detail={arrow(r.rsi, r.rsiPrev)}
-                          title={`RSI(${RSI_LENGTH}) ${up ? "rose" : "fell"} on the previous candle`}
-                        />
-                      </td>
-                      <td className="py-4">
-                        <CheckCell
-                          met={r.checks.adx}
-                          detail={arrow(r.adx, r.adxPrev)}
-                          title={`ADX(${ADX_LENGTH}) rose on the previous candle`}
-                        />
-                      </td>
-                      <td className="py-4">
-                        <CheckCell
-                          met={r.checks.oi}
-                          detail={
-                            r.oiChange == null
-                              ? "n/a"
-                              : `${r.oiChange >= 0 ? "+" : ""}${r.oiChange.toFixed(2)}%`
-                          }
-                          title="Open interest rose over the previous candle — new positions opening"
-                        />
-                      </td>
-                      <td className="py-4">
-                        <CheckCell
-                          met={r.checks.engulf}
-                          detail={up ? "bullish" : "bearish"}
-                          title={`${up ? "Bullish" : "Bearish"} engulfing on the previous candle`}
-                        />
-                      </td>
-                      <td
-                        className="py-4 font-mono text-xs text-gray-300"
-                        title={`ATR(${ATR_LENGTH}) is ${r.tradability.volatilityRatio.toFixed(2)}× the scan median`}
-                      >
-                        {r.atrPercent.toFixed(2)}%
-                      </td>
-                      <td className="py-4 font-mono text-xs text-gray-300">
-                        {formatVolume(r.volume)}
-                      </td>
-                      <td className="py-4">
-                        <Change value={r.changePercent} />
-                      </td>
-                    </tr>
-                  );
-                })}
-                {rows.length === 0 && (
-                  <tr>
-                    <td colSpan={13} className="py-12 text-center text-gray-500">
-                      No coin is near EMA 50 / 200 on this close
-                    </td>
-                  </tr>
-                )}
-              </tbody>
-            </table>
-          </div>
-        </div>
+        <SetupTable
+          title="🎯 All criteria"
+          badgeClass="bg-emerald-500/20 text-emerald-300"
+          rows={result.full}
+          total={result.fullTotal}
+          subtitle="KST cross + EMA trend + RSI neutral + near EMA • most tradable first"
+          empty="No coin meets all four criteria on this close"
+          showScore={false}
+        />
+
+        <SetupTable
+          title="👀 Partial — KST vs EMA"
+          badgeClass="bg-amber-500/20 text-amber-300"
+          rows={result.partial}
+          total={result.partialTotal}
+          subtitle={`Fresh KST cross against the EMA stack, or EMA ${EMA_FAST}/${EMA_SLOW} cross in the last ${EMA_CROSS_BARS} candles with KST the other way • side = the fresh signal`}
+          empty="No KST / EMA disagreements on this close"
+          showScore
+        />
 
         <p className="text-center text-xs text-gray-500">
-          Gate: close within {NEAR_ATR} ATR({ATR_LENGTH}) of EMA 50 or EMA 200,
-          either side • Score = confirmations on the previous {INTERVAL_LABEL}{" "}
-          candle: KST({KST_ROC.join(" ")} / {KST_SMA.join(" ")} / {KST_SIGNAL})
-          crossed its signal, RSI({RSI_LENGTH}) moved the trade&apos;s way,
-          ADX({ADX_LENGTH}) rose, open interest rose, engulfing candle • Side is
-          the majority of KST / engulf / RSI; shorts are the mirror • Ties
-          broken by volatility × liquidity (ATR% vs the scan median{" "}
-          {medianAtrPercent.toFixed(2)}%, 24h volume) • Breadth = share of
-          pairs closing above {INTERVAL_LABEL} EMA {EMA_BREADTH} • Scanned{" "}
-          {scanned} perpetuals with 24h quote volume ≥ $
-          {(MIN_VOLUME / 1_000_000).toFixed(0)}M • No SL/TP shown by design —
-          read the levels off the chart
+          KST({KST_ROC.join(" ")} / {KST_SMA.join(" ")} / {KST_SIGNAL}) crossed
+          its signal within the last {KST_CROSS_BARS} closed candles and that
+          is still the latest cross • EMA {EMA_FAST} above (long) / below
+          (short) EMA {EMA_SLOW} • RSI({RSI_LENGTH}) {RSI_NEUTRAL_LO}–
+          {RSI_NEUTRAL_HI} • close within {NEAR_ATR} ATR({ATR_LENGTH}) of EMA{" "}
+          {EMA_FAST} or {EMA_SLOW} • Side = recent KST cross, else EMA stack •
+          Filter: 24h volume ≥ ${(SCAN_MIN_VOLUME / 1_000_000).toFixed(0)}M and
+          ATR% {MIN_VOL_RATIO}×–{MAX_VOL_RATIO}× the scan median (
+          {result.medianAtrPercent.toFixed(2)}%) — {result.filteredOut} of{" "}
+          {market.total} pairs cut as too thin, too quiet or too wild • Scanned{" "}
+          {result.scanned} perpetuals • No SL/TP shown by design — read the
+          levels off the chart
         </p>
       </div>
     </div>
