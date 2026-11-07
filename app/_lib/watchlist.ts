@@ -1,5 +1,5 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
-// EMA + KST + RSI trend-pullback scanner, on INTERVAL (30m) candles.
+// EMA + KST + RSI trend-pullback scanner, on INTERVAL (1h) candles.
 //
 // Four criteria, all read off the last closed candle:
 //
@@ -40,9 +40,9 @@ import {
 // ─────────────────────────── PARAMETERS ───────────────────────────
 
 /** The scanner's timeframe. */
-export const INTERVAL = "30m";
-export const CANDLE_MS = 30 * 60_000;
-export const INTERVAL_LABEL = "30M";
+export const INTERVAL = "1h";
+export const CANDLE_MS = 60 * 60_000;
+export const INTERVAL_LABEL = "1H";
 
 export const EMA_FAST = 50;
 export const EMA_SLOW = 200;
@@ -79,7 +79,7 @@ export type Criterion = (typeof CRITERIA)[number];
 /** Enough bars for EMA 200 to exist at all. */
 export const MIN_CANDLES = 220;
 
-/** 48 × 30m = the 24h window for volume and change, on closed candles only. */
+/** 24 × 1h = the 24h window for volume and change, on closed candles only. */
 export const DAY_BARS = (24 * 60 * 60_000) / CANDLE_MS;
 
 export type Side = "LONG" | "SHORT";
