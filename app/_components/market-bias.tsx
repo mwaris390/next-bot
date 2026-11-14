@@ -13,7 +13,7 @@
 // filters nothing.
 
 import type { BtcMomentum } from "../_lib/btc-momentum";
-import { INTERVAL_LABEL } from "../_lib/watchlist";
+import { INTERVAL_LABEL } from "../_lib/ema-zone";
 
 export interface MarketStats {
   total: number;

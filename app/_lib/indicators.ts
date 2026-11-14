@@ -112,7 +112,7 @@ export function emaSeries(values: number[], period: number): number[] {
  * back to `high - low` on the first bar, `ta.tr` (i.e. `tr(false)`) leaves it
  * na. ATR is built on the first, as in Pine.
  */
-function trueRangeSeries(
+export function trueRangeSeries(
   highs: number[],
   lows: number[],
   closes: number[],
@@ -203,4 +203,177 @@ export function barsSinceCross(a: number[], b: number[], at: number): CrossInfo 
     if (now < 0 && before >= 0) return { side: "DOWN", barsSince: at - i };
   }
   return { side: null, barsSince: null };
+}
+
+// ─────────────────────── Rolling-window helpers ───────────────────────
+// Same contract as above: output length = input length, NaN through warm-up,
+// and a window that holds an na produces an na (Pine's behaviour after warm-up).
+
+/** Runs `pick` over each full, hole-free window of `period` values ending at i. */
+function rolling(
+  values: number[],
+  period: number,
+  pick: (window: number[]) => number,
+): number[] {
+  const out = new Array<number>(values.length).fill(NaN);
+  let holes = 0;
+  for (let i = 0; i < values.length; i++) {
+    if (!Number.isFinite(values[i])) holes += 1;
+    if (i >= period && !Number.isFinite(values[i - period])) holes -= 1;
+    if (i >= period - 1 && holes === 0) {
+      out[i] = pick(values.slice(i - period + 1, i + 1));
+    }
+  }
+  return out;
+}
+
+/** `ta.highest` — max of the last `period` values, current bar included. */
+export function highestSeries(values: number[], period: number): number[] {
+  return rolling(values, period, (w) => Math.max(...w));
+}
+
+/** `ta.lowest` — min of the last `period` values, current bar included. */
+export function lowestSeries(values: number[], period: number): number[] {
+  return rolling(values, period, (w) => Math.min(...w));
+}
+
+/** `math.sum` — rolling sum over `period` values. */
+export function sumSeries(values: number[], period: number): number[] {
+  return rolling(values, period, (w) => w.reduce((a, b) => a + b, 0));
+}
+
+/** `ta.stdev` — population (biased) standard deviation, Pine's default. */
+export function stdevSeries(values: number[], period: number): number[] {
+  return rolling(values, period, (w) => {
+    const mean = w.reduce((a, b) => a + b, 0) / w.length;
+    return Math.sqrt(w.reduce((a, b) => a + (b - mean) ** 2, 0) / w.length);
+  });
+}
+
+/**
+ * `ta.percentrank` — percent (0–100) of the previous `period` values that are
+ * less than or equal to the current one. The current bar is not in the window.
+ */
+export function percentRankSeries(values: number[], period: number): number[] {
+  const out = new Array<number>(values.length).fill(NaN);
+  for (let i = period; i < values.length; i++) {
+    const current = values[i];
+    if (!Number.isFinite(current)) continue;
+    let count = 0;
+    let complete = true;
+    for (let j = i - period; j < i; j++) {
+      if (!Number.isFinite(values[j])) {
+        complete = false;
+        break;
+      }
+      if (values[j] <= current) count += 1;
+    }
+    if (complete) out[i] = (count / period) * 100;
+  }
+  return out;
+}
+
+/** `ta.percentile_nearest_rank` — nearest-rank percentile of the last `period` values. */
+export function percentileNearestRankSeries(
+  values: number[],
+  period: number,
+  percentage: number,
+): number[] {
+  return rolling(values, period, (w) => {
+    const sorted = [...w].sort((a, b) => a - b);
+    const rank = Math.max(1, Math.ceil((percentage / 100) * sorted.length));
+    return sorted[rank - 1];
+  });
+}
+
+/** `ta.median` — median of the last `period` values. */
+export function medianSeries(values: number[], period: number): number[] {
+  return rolling(values, period, (w) => {
+    const sorted = [...w].sort((a, b) => a - b);
+    const mid = Math.floor(sorted.length / 2);
+    return sorted.length % 2 === 0 ? (sorted[mid - 1] + sorted[mid]) / 2 : sorted[mid];
+  });
+}
+
+/** `ta.barssince` — bars since `condition` was last true (0 = this bar), NaN if never. */
+export function barsSinceSeries(condition: boolean[]): number[] {
+  const out = new Array<number>(condition.length).fill(NaN);
+  let last = -1;
+  for (let i = 0; i < condition.length; i++) {
+    if (condition[i]) last = i;
+    if (last >= 0) out[i] = i - last;
+  }
+  return out;
+}
+
+/** `x[n]` — the series shifted back `n` bars (NaN where there is no history). */
+export function shiftSeries(values: number[], n = 1): number[] {
+  return values.map((_, i) => (i - n >= 0 ? values[i - n] : NaN));
+}
+
+// ─────────────────────── DMI / ADX and KST ───────────────────────
+
+/**
+ * `ta.dmi(diLength, adxSmoothing)` — [+DI, −DI, ADX]. Built on `ta.tr` (na on
+ * the first bar), RMA-smoothed, exactly as Pine's reference implementation.
+ */
+export function dmiSeries(
+  highs: number[],
+  lows: number[],
+  closes: number[],
+  diLength: number,
+  adxSmoothing: number,
+): { plus: number[]; minus: number[]; adx: number[] } {
+  const n = highs.length;
+  const plusDm = new Array<number>(n).fill(NaN);
+  const minusDm = new Array<number>(n).fill(NaN);
+  for (let i = 1; i < n; i++) {
+    const up = highs[i] - highs[i - 1];
+    const down = lows[i - 1] - lows[i];
+    plusDm[i] = up > down && up > 0 ? up : 0;
+    minusDm[i] = down > up && down > 0 ? down : 0;
+  }
+  const trur = rmaSeries(trueRangeSeries(highs, lows, closes, false), diLength);
+  const plusS = rmaSeries(plusDm, diLength);
+  const minusS = rmaSeries(minusDm, diLength);
+
+  const plus = new Array<number>(n).fill(NaN);
+  const minus = new Array<number>(n).fill(NaN);
+  const dx = new Array<number>(n).fill(NaN);
+  for (let i = 0; i < n; i++) {
+    if (!Number.isFinite(trur[i]) || trur[i] === 0) continue;
+    plus[i] = (100 * plusS[i]) / trur[i];
+    minus[i] = (100 * minusS[i]) / trur[i];
+    const sum = plus[i] + minus[i];
+    dx[i] = Math.abs(plus[i] - minus[i]) / (sum === 0 ? 1 : sum);
+  }
+  const adx = rmaSeries(dx, adxSmoothing).map((v) => 100 * v);
+  return { plus, minus, adx };
+}
+
+/** KST: weighted (1,2,3,4) sum of SMA-smoothed ROCs, plus its SMA signal line. */
+export function kstSeries(
+  closes: number[],
+  roc: readonly number[],
+  sma: readonly number[],
+  signalLength: number,
+): { kst: number[]; signal: number[] } {
+  const legs = roc.map((rocLength, index) =>
+    smaSeries(rocSeries(closes, rocLength), sma[index]),
+  );
+  const kst = new Array<number>(closes.length).fill(NaN);
+  for (let i = 0; i < closes.length; i++) {
+    let total = 0;
+    let complete = true;
+    for (let leg = 0; leg < legs.length; leg++) {
+      const value = legs[leg][i];
+      if (!Number.isFinite(value)) {
+        complete = false;
+        break;
+      }
+      total += (leg + 1) * value;
+    }
+    if (complete) kst[i] = total;
+  }
+  return { kst, signal: smaSeries(kst, signalLength) };
 }
