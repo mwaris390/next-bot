@@ -295,17 +295,6 @@ export function medianSeries(values: number[], period: number): number[] {
   });
 }
 
-/** `ta.barssince` — bars since `condition` was last true (0 = this bar), NaN if never. */
-export function barsSinceSeries(condition: boolean[]): number[] {
-  const out = new Array<number>(condition.length).fill(NaN);
-  let last = -1;
-  for (let i = 0; i < condition.length; i++) {
-    if (condition[i]) last = i;
-    if (last >= 0) out[i] = i - last;
-  }
-  return out;
-}
-
 /** `x[n]` — the series shifted back `n` bars (NaN where there is no history). */
 export function shiftSeries(values: number[], n = 1): number[] {
   return values.map((_, i) => (i - n >= 0 ? values[i - n] : NaN));

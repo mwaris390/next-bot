@@ -75,7 +75,7 @@ function getServerSecondsSnapshot(): null {
  * anyway. The timer is scheduled at the boundary and re-armed afterwards
  * rather than polling for the crossing.
  *
- * The watchlist reads closed candles only (see app/_lib/ema-zone.ts), so
+ * The watchlist reads closed candles only (see app/_lib/watchlist.ts), so
  * it omits `sampleMs` and scans once per close. `sampleMs` stays for a scanner
  * whose indicators read the still-forming candle. "Refresh now" re-reads on
  * demand.
