@@ -1,15 +1,12 @@
 import { unstable_rethrow } from "next/navigation";
 import AutoRefresh from "./_components/auto-refresh";
 import BtcMeter from "./_components/btc-meter";
-import MarketBias from "./_components/market-bias";
-import RowContextTags, { ConfidenceCell, VerdictCell } from "./_components/row-context";
+import MarketBias, { type MarketStats } from "./_components/market-bias";
 import {
   CANDLE_CACHE_GRACE_MS,
   RateLimitedError,
   getFilteredPairs,
-  getFundingRates,
   getKlines,
-  getOpenInterestChanges,
   isNearWeightCap,
   isPastWeightSoftCap,
   isThrottled,
@@ -40,14 +37,6 @@ import {
   type Side,
   evaluate,
 } from "./_lib/watchlist";
-import {
-  type MarketRegime,
-  type PairRegime,
-  type RowContext,
-  buildMarketRegime,
-  pairRegime,
-  rowContext,
-} from "./_lib/market-regime";
 import {
   type Tradability,
   VOL_GOOD_LO,
@@ -93,7 +82,6 @@ type Row = Reading & {
   symbol: string;
   met: number;
   tradability: Tradability;
-  ctx?: RowContext;
 };
 
 interface ScanResult {
@@ -102,20 +90,16 @@ interface ScanResult {
   fullTotal: number;
   partialTotal: number;
   filteredOut: number;
-  market: MarketRegime;
-  btc: BtcMomentum | null;
+  market: MarketStats;
   medianAtrPercent: number;
   scanned: number;
   rateLimited: boolean;
   scannedAt: number;
 }
 
-async function scan(btcPromise: Promise<BtcMomentum | null>): Promise<ScanResult> {
+async function scan(): Promise<ScanResult> {
   const pairs = await getFilteredPairs();
-  // One call for the whole universe's funding, held until the next close.
-  const fundingPromise = getFundingRates(candleTtlMs());
   const readings: { symbol: string; reading: Reading }[] = [];
-  const regimes = new Map<string, PairRegime>();
   let rateLimited = false;
 
   for (let i = 0; i < pairs.length; i += MAX_CONCURRENT) {
@@ -144,8 +128,6 @@ async function scan(btcPromise: Promise<BtcMomentum | null>): Promise<ScanResult
             candleTtlMs(),
           );
           const reading = evaluate(klines);
-          const regime = pairRegime(klines);
-          if (regime) regimes.set(pair.symbol, regime);
           return reading ? { symbol: pair.symbol, reading } : null;
         } catch (error) {
           if (error instanceof RateLimitedError) rateLimited = true;
@@ -162,8 +144,23 @@ async function scan(btcPromise: Promise<BtcMomentum | null>): Promise<ScanResult
   }
 
   // Market read: the whole universe, before any filter.
-  const [funding, btc] = await Promise.all([fundingPromise, btcPromise]);
-  const market = buildMarketRegime(regimes, funding, btc);
+  const market: MarketStats = {
+    total: readings.length,
+    aboveEma50: 0,
+    emaBullStack: 0,
+    kstAbove: 0,
+    kstUp: 0,
+    kstDown: 0,
+  };
+  for (const { reading: r } of readings) {
+    if (r.kstAbove) market.kstAbove += 1;
+    if (r.closedPrice > r.ema50) market.aboveEma50 += 1;
+    if (r.ema50 > r.ema200) market.emaBullStack += 1;
+    if (r.kstBarsAgo != null && r.kstBarsAgo < KST_CROSS_BARS) {
+      if (r.kstCrossSide === "LONG") market.kstUp += 1;
+      else if (r.kstCrossSide === "SHORT") market.kstDown += 1;
+    }
+  }
 
   // Volatility is judged against the whole scan's median.
   const medianAtrPercent = median(readings.map(({ reading }) => reading.atrPercent));
@@ -196,42 +193,13 @@ async function scan(btcPromise: Promise<BtcMomentum | null>): Promise<ScanResult
     )
     .sort((a, b) => b.met - a.met || byTradability(a, b));
 
-  // Per-row context. Open interest is per-symbol, so only the rows on screen.
-  const fullShown = full.slice(0, DISPLAY_LIMIT);
-  const partialShown = partial.slice(0, DISPLAY_LIMIT);
-  const oi = await getOpenInterestChanges(
-    [...fullShown, ...partialShown].map((r) => r.symbol),
-    candleTtlMs(),
-  );
-  const btcRet24 = regimes.get("BTCUSDT")?.ret24 ?? null;
-  const withContext = (r: Row): Row => ({
-    ...r,
-    ctx: rowContext({
-      symbol: r.symbol,
-      side: r.side,
-      volatilityRatio: r.tradability.volatilityRatio,
-      pair: regimes.get(r.symbol),
-      market,
-      fundingRate: funding?.get(r.symbol),
-      btcRet24,
-      oiChange: oi.get(r.symbol),
-      setupPros: [
-        r.met === CRITERIA.length ? `All ${CRITERIA.length} criteria met` : `${r.met}/${CRITERIA.length} criteria`,
-        ...(r.kstCrossSide === r.side && r.kstBarsAgo != null && r.kstBarsAgo < KST_CROSS_BARS
-          ? ["Fresh KST cross your way"]
-          : []),
-      ],
-    }),
-  });
-
   return {
-    full: fullShown.map(withContext),
-    partial: partialShown.map(withContext),
+    full: full.slice(0, DISPLAY_LIMIT),
+    partial: partial.slice(0, DISPLAY_LIMIT),
     fullTotal: full.length,
     partialTotal: partial.length,
     filteredOut,
     market,
-    btc,
     medianAtrPercent,
     scanned: pairs.length,
     rateLimited,
@@ -476,7 +444,7 @@ function SetupTable({
   showScore: boolean;
 }) {
   const longs = rows.filter((r) => r.side === "LONG").length;
-  const columns = 11 + (showScore ? 1 : 0);
+  const columns = 9 + (showScore ? 1 : 0);
   return (
     <div className="bg-gray-900 rounded-3xl shadow-2xl p-8">
       <div className="mb-6 flex flex-wrap items-baseline gap-x-4 gap-y-2">
@@ -498,12 +466,10 @@ function SetupTable({
               <TH>#</TH>
               <TH>Pair</TH>
               <TH>Side</TH>
-              <TH>Verdict</TH>
               {showScore && <TH>Conflict</TH>}
               {CRITERIA.map((c) => (
                 <TH key={c}>{HEADER[c]}</TH>
               ))}
-              <TH>Market context</TH>
               <TH>ATR%</TH>
               <TH>24h volume</TH>
               <TH>24h %</TH>
@@ -513,20 +479,13 @@ function SetupTable({
             {rows.map((r, i) => (
               <tr
                 key={r.symbol}
-                title={r.ctx?.dimReason ?? undefined}
-                className={`border-b border-gray-800 hover:bg-gray-800/70 transition-colors ${
-                  r.ctx?.dim ? "opacity-40" : ""
-                }`}
+                className="border-b border-gray-800 hover:bg-gray-800/70 transition-colors"
               >
                 <td className="py-4">{i + 1}</td>
                 <td className="py-4 font-semibold">{r.symbol}</td>
                 <td className="py-4">
-                  <span className="inline-flex flex-col gap-2">
-                    <SidePill side={r.side} />
-                    {r.ctx && <ConfidenceCell ctx={r.ctx} />}
-                  </span>
+                  <SidePill side={r.side} />
                 </td>
-                <td className="py-4 pr-4">{r.ctx && <VerdictCell ctx={r.ctx} />}</td>
                 {showScore && (
                   <td className="py-4">
                     <ConflictCell r={r} />
@@ -537,9 +496,6 @@ function SetupTable({
                     {CRITERION_CELL[c]({ r })}
                   </td>
                 ))}
-                <td className="py-4 pr-4">
-                  {r.ctx && <RowContextTags ctx={r.ctx} />}
-                </td>
                 <td
                   className="py-4 font-mono text-xs text-gray-300"
                   title={`ATR(${ATR_LENGTH}) is ${r.tradability.volatilityRatio.toFixed(2)}× the scan median`}
@@ -572,9 +528,13 @@ function SetupTable({
 
 export default async function TrendPullbackScanner() {
   let result: ScanResult;
+  let btc: BtcMomentum | null = null;
 
   try {
-    result = await scan(getBtcMomentum(ttlUntilClose(BTC_CANDLE_MS)));
+    [result, btc] = await Promise.all([
+      scan(),
+      getBtcMomentum(ttlUntilClose(BTC_CANDLE_MS)),
+    ]);
   } catch (error) {
     // Next signals "this route must render dynamically" by throwing — that's
     // control flow, not a scanner failure, so it has to pass straight through.
@@ -590,7 +550,7 @@ export default async function TrendPullbackScanner() {
     );
   }
 
-  const { market, btc } = result;
+  const { market } = result;
   const breadth =
     market.total > 0
       ? {
@@ -605,7 +565,7 @@ export default async function TrendPullbackScanner() {
       <div className="max-w-7xl mx-auto space-y-10">
         <div className="grid items-start gap-6 lg:grid-cols-[16rem_1fr_16rem]">
           <div className="flex justify-center lg:justify-start">
-            <MarketBias market={market} />
+            <MarketBias stats={market} btc={btc} />
           </div>
 
           <div className="text-center">
