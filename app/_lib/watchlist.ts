@@ -3,8 +3,8 @@
 //
 // Four criteria, all read off the last closed candle:
 //
-//   KST CROSS — KST crossed its signal within the last KST_CROSS_BARS closed
-//               candles, and that is still the latest cross. Up = long,
+//   KST       — KST on the trade's side of its signal: aligned, or just
+//               crossed (within KST_CROSS_BARS closed candles). Up = long,
 //               down = short.
 //   EMA TREND — EMA 50 above EMA 200 (long) / below it (short): the trend the
 //               trade leans on.
@@ -18,6 +18,11 @@
 // a fresh KST cross against the EMA stack, or a fresh EMA 50/200 cross with
 // KST on the other side of its signal (see `conflict`).
 //
+// 15M GATE: a 1h row is only shown when the 15m chart agrees with its side —
+// EMA 8 > 12 > 21 and KST above its signal for a long, the mirror for a short
+// (see `evaluateTrigger`). The 1h compression and CEB-X read (./hourly-context)
+// ride along as badges.
+//
 // Volume and volatility are filters here, not ranking hints: a coin has to be
 // liquid and actually moving (against the scan's own median ATR%) to be shown
 // at all, because the quiet ones that tick every box are the ones drifting
@@ -28,6 +33,7 @@
 // until the next close. Callers pass the full Binance kline array; the forming
 // candle (always last) is dropped here and nowhere else.
 
+import { type CebX, type Compression, cebX, compression } from "./hourly-context";
 import {
   atrSeries,
   barsSinceCross,
@@ -43,6 +49,12 @@ import {
 export const INTERVAL = "1h";
 export const CANDLE_MS = 60 * 60_000;
 export const INTERVAL_LABEL = "1H";
+
+/** The 15m gate's timeframe and EMA ribbon. */
+export const TRIGGER_INTERVAL = "15m";
+export const TRIGGER_CANDLE_MS = 15 * 60_000;
+export const TRIGGER_INTERVAL_LABEL = "15M";
+export const TRIGGER_EMAS = [8, 12, 21] as const;
 
 export const EMA_FAST = 50;
 export const EMA_SLOW = 200;
@@ -203,7 +215,7 @@ export function evaluate(klines: any[]): Reading | null {
   return {
     side,
     criteria: {
-      kst: recentCross && kstCrossSide === side,
+      kst: kstAbove === (side === "LONG"),
       ema: emaSide === side,
       rsi: rsi >= RSI_NEUTRAL_LO && rsi <= RSI_NEUTRAL_HI,
       near: Math.abs(touches[0].distanceAtr) <= NEAR_ATR,
@@ -231,4 +243,56 @@ export function evaluate(klines: any[]): Reading | null {
     volume24h,
     change24h: ((closedPrice - dayAgo) / dayAgo) * 100,
   };
+}
+
+// ─────────────────────────── 1H CONTEXT ───────────────────────────
+
+export interface HourlyContext {
+  /** 1h compression on the last closed bar (badge only). */
+  compression: Compression;
+  /** 1h CEB-X breakout / fakeout events (badge only). */
+  ceb: CebX;
+}
+
+/**
+ * Compression + CEB-X off a FULL 1h kline series (forming candle dropped
+ * here). Heavier than `evaluate`, so the page only runs it on shown rows.
+ */
+export function hourlyContext(klines: any[]): HourlyContext {
+  const bars = klines.slice(0, -1);
+  const highs = bars.map((k: any) => parseFloat(k[2]));
+  const lows = bars.map((k: any) => parseFloat(k[3]));
+  const closes = bars.map((k: any) => parseFloat(k[4]));
+  return {
+    compression: compression(highs, lows, closes),
+    ceb: cebX(highs, lows, closes),
+  };
+}
+
+// ─────────────────────────── 15M GATE ───────────────────────────
+
+export interface Trigger {
+  /** LONG when EMA 8 > 12 > 21 and KST > signal, SHORT for the mirror, else null. */
+  side: Side | null;
+  emas: number[];
+  kstAbove: boolean;
+}
+
+/** Reads the last closed 15m candle of a FULL kline series. */
+export function evaluateTrigger(klines: any[]): Trigger | null {
+  const closes = klines.slice(0, -1).map((k: any) => parseFloat(k[4]));
+  const last = closes.length - 1;
+  const emas = TRIGGER_EMAS.map((length) => emaSeries(closes, length)[last]);
+  const { kst, signal } = kstSeries(closes);
+  if (![...emas, kst[last], signal[last]].every(Number.isFinite)) return null;
+
+  const kstAbove = kst[last] > signal[last];
+  const [fast, mid, slow] = emas;
+  const side: Side | null =
+    fast > mid && mid > slow && kstAbove
+      ? "LONG"
+      : fast < mid && mid < slow && !kstAbove
+        ? "SHORT"
+        : null;
+  return { side, emas, kstAbove };
 }

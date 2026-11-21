@@ -204,3 +204,88 @@ export function barsSinceCross(a: number[], b: number[], at: number): CrossInfo 
   }
   return { side: null, barsSince: null };
 }
+
+/** `ta.stdev` (biased, Pine's default) — rolling population standard deviation. */
+export function stdevSeries(values: number[], period: number): number[] {
+  const out = new Array<number>(values.length).fill(NaN);
+  for (let i = period - 1; i < values.length; i++) {
+    let sum = 0;
+    let ok = true;
+    for (let j = i - period + 1; j <= i; j++) {
+      if (!Number.isFinite(values[j])) {
+        ok = false;
+        break;
+      }
+      sum += values[j];
+    }
+    if (!ok) continue;
+    const mean = sum / period;
+    let sq = 0;
+    for (let j = i - period + 1; j <= i; j++) sq += (values[j] - mean) ** 2;
+    out[i] = Math.sqrt(sq / period);
+  }
+  return out;
+}
+
+/**
+ * `ta.percentrank` — percent of the previous `period` values that are less
+ * than or equal to the current one.
+ */
+export function percentRankSeries(values: number[], period: number): number[] {
+  const out = new Array<number>(values.length).fill(NaN);
+  for (let i = period; i < values.length; i++) {
+    const now = values[i];
+    if (!Number.isFinite(now)) continue;
+    let count = 0;
+    let ok = true;
+    for (let j = 1; j <= period; j++) {
+      const past = values[i - j];
+      if (!Number.isFinite(past)) {
+        ok = false;
+        break;
+      }
+      if (past <= now) count += 1;
+    }
+    if (ok) out[i] = (count / period) * 100;
+  }
+  return out;
+}
+
+/** `ta.dmi(len, len)` — returns the ADX series. */
+export function adxSeries(
+  highs: number[],
+  lows: number[],
+  closes: number[],
+  period: number,
+): number[] {
+  const n = highs.length;
+  const plusDm = new Array<number>(n).fill(NaN);
+  const minusDm = new Array<number>(n).fill(NaN);
+  for (let i = 1; i < n; i++) {
+    const up = highs[i] - highs[i - 1];
+    const down = lows[i - 1] - lows[i];
+    plusDm[i] = up > down && up > 0 ? up : 0;
+    minusDm[i] = down > up && down > 0 ? down : 0;
+  }
+  // `ta.dmi` smooths `ta.tr`, which is na on the first bar.
+  const trur = rmaSeries(trueRangeSeries(highs, lows, closes, false), period);
+  const plusS = rmaSeries(plusDm, period);
+  const minusS = rmaSeries(minusDm, period);
+  const dx = new Array<number>(n).fill(NaN);
+  for (let i = 0; i < n; i++) {
+    if (![trur[i], plusS[i], minusS[i]].every(Number.isFinite) || trur[i] === 0) continue;
+    const plus = (100 * plusS[i]) / trur[i];
+    const minus = (100 * minusS[i]) / trur[i];
+    const sum = plus + minus;
+    dx[i] = Math.abs(plus - minus) / (sum === 0 ? 1 : sum);
+  }
+  return rmaSeries(dx, period).map((v) => 100 * v);
+}
+
+/** Median of a list (average of the two middles when even); NaN when empty. */
+export function medianOf(values: number[]): number {
+  if (values.length === 0) return NaN;
+  const sorted = [...values].sort((a, b) => a - b);
+  const mid = sorted.length >> 1;
+  return sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+}
