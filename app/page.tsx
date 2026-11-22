@@ -35,14 +35,8 @@ import {
   RSI_NEUTRAL_LO,
   type Reading,
   type Side,
-  TRIGGER_CANDLE_MS,
-  TRIGGER_EMAS,
-  TRIGGER_INTERVAL,
-  TRIGGER_INTERVAL_LABEL,
   type HourlyContext,
-  type Trigger,
   evaluate,
-  evaluateTrigger,
   hourlyContext,
 } from "./_lib/watchlist";
 import {
@@ -64,8 +58,6 @@ import {
 // regime test reads VR(16, 512) on the bar before a break, plus a replay
 // window — ~570 closed bars at least. 999 is the most that bucket buys.
 const KLINE_LIMIT = 999;
-// The 15m gate only needs EMA 21 and KST (≈45 bars of warm-up) to settle.
-const TRIGGER_KLINE_LIMIT = 199;
 
 // One clock: everything reads the last CLOSED candle (see ./_lib/watchlist),
 // so nothing changes until the next close. Klines are held until then and the
@@ -74,7 +66,6 @@ function ttlUntilClose(periodMs: number): number {
   return periodMs - (Date.now() % periodMs) + CANDLE_CACHE_GRACE_MS;
 }
 const candleTtlMs = () => ttlUntilClose(CANDLE_MS);
-const triggerTtlMs = () => ttlUntilClose(TRIGGER_CANDLE_MS);
 // The BTC card keeps its own 1h clock (see ./_lib/btc-momentum).
 const BTC_CANDLE_MS = 60 * 60_000;
 
@@ -99,12 +90,6 @@ type Row = Reading & {
   symbol: string;
   met: number;
   tradability: Tradability;
-  trigger: Trigger;
-  /**
-   * Partial rows only: which 1h reads (EMA 50/200, KST) point against the
-   * 15m-aligned side. Null when 1h is with the 15m.
-   */
-  tfConflict: { ema: boolean; kst: boolean } | null;
 } & HourlyContext;
 
 interface ScanResult {
@@ -113,8 +98,6 @@ interface ScanResult {
   fullTotal: number;
   partialTotal: number;
   filteredOut: number;
-  /** 1h candidates dropped because the 15m chart disagreed. */
-  gatedOut: number;
   market: MarketStats;
   medianAtrPercent: number;
   scanned: number;
@@ -124,7 +107,7 @@ interface ScanResult {
 
 /**
  * Fetches klines for every symbol in rate-limited batches and maps each series
- * through `read`. Shared by the 1h pass (whole universe) and the 15m gate.
+ * through `read`.
  */
 async function fetchEach<T>(
   symbols: string[],
@@ -217,7 +200,7 @@ async function scan(): Promise<ScanResult> {
   // Volatility is judged against the whole scan's median.
   const medianAtrPercent = median(readings.map(({ reading }) => reading.atrPercent));
 
-  type Base = Omit<Row, "trigger" | "tfConflict" | keyof HourlyContext>;
+  type Base = Omit<Row, keyof HourlyContext>;
   const rows: Base[] = [];
   let filteredOut = 0;
   for (const { symbol, reading } of readings) {
@@ -234,72 +217,21 @@ async function scan(): Promise<ScanResult> {
     rows.push({ ...reading, symbol, met, tradability: t });
   }
 
-  // 1h candidates for either table, before the 15m gate.
-  const isFull = (r: Base) => r.met === CRITERIA.length;
-  // Partial = KST and the EMAs disagree on 1h, one way or the other.
-  const isPartial = (r: Base) =>
-    r.met < CRITERIA.length && (r.conflict.kstVsEma || r.conflict.emaVsKst);
-
-  // 15m read for every pair that passed the filter: it gates the 1h rows
-  // and also brings in the 15m-aligned / 1h-not-aligned Partial rows.
-  const triggers = await fetchEach(
-    rows.map((r) => r.symbol),
-    TRIGGER_INTERVAL,
-    TRIGGER_KLINE_LIMIT,
-    triggerTtlMs,
-    evaluateTrigger,
-  );
-  if (triggers.rateLimited) rateLimited = true;
-
-  type Gated = Omit<Row, keyof HourlyContext>;
-  const full: Gated[] = [];
-  const partial: Gated[] = [];
-  let gatedOut = 0;
-  for (const r of rows) {
-    const trigger = triggers.results.get(r.symbol);
-    const was1hCandidate = isFull(r) || isPartial(r);
-    if (!trigger) {
-      if (was1hCandidate) gatedOut += 1;
-      continue;
-    }
-
-    // Is 1h with the 15m side? EMA 50/200 and KST, each on its own.
-    const tfConflict = trigger.side
-      ? {
-          ema: r.ema50 >= r.ema200 !== (trigger.side === "LONG"),
-          kst: r.kstAbove !== (trigger.side === "LONG"),
-        }
-      : null;
-    const tfDisagrees = tfConflict != null && (tfConflict.ema || tfConflict.kst);
-
-    if (trigger.side === r.side && isFull(r)) {
-      full.push({ ...r, trigger, tfConflict: null });
-    } else if (trigger.side === r.side && isPartial(r)) {
-      partial.push({ ...r, trigger, tfConflict: tfDisagrees ? tfConflict : null });
-    } else if (tfDisagrees && trigger.side) {
-      // 15m aligned, 1h not (fully) with it: the row takes the 15m side, and
-      // the 1h criteria are re-read against that side.
-      const side = trigger.side;
-      const criteria = {
-        ...r.criteria,
-        kst: r.kstAbove === (side === "LONG"),
-        ema: r.ema50 >= r.ema200 === (side === "LONG"),
-      };
-      const met = CRITERIA.filter((c) => criteria[c]).length;
-      partial.push({ ...r, side, criteria, met, trigger, tfConflict });
-    } else if (was1hCandidate) {
-      gatedOut += 1;
-    }
-  }
-
-  const byTradability = (a: Gated, b: Gated) => b.tradability.score - a.tradability.score;
-  full.sort(byTradability);
-  // Rows that also meet RSI neutral / near EMA rank first.
-  partial.sort((a, b) => b.met - a.met || byTradability(a, b));
+  const byTradability = (a: Base, b: Base) => b.tradability.score - a.tradability.score;
+  const full = rows.filter((r) => r.met === CRITERIA.length).sort(byTradability);
+  // Partial = KST and the EMAs disagree, one way or the other. Rows that also
+  // meet RSI neutral / near EMA rank first.
+  const partial = rows
+    .filter(
+      (r) =>
+        r.met < CRITERIA.length &&
+        (r.conflict.kstVsEma || r.conflict.emaVsKst),
+    )
+    .sort((a, b) => b.met - a.met || byTradability(a, b));
 
   // 1h compression + CEB-X badges, only for the rows that get shown, off the
   // 1h series already in cache.
-  const withContext = async (shown: Gated[]): Promise<Row[]> => {
+  const withContext = async (shown: Base[]): Promise<Row[]> => {
     const out: Row[] = [];
     for (const r of shown) {
       let context: HourlyContext = NO_CONTEXT;
@@ -325,7 +257,6 @@ async function scan(): Promise<ScanResult> {
     fullTotal: full.length,
     partialTotal: partial.length,
     filteredOut,
-    gatedOut,
     market,
     medianAtrPercent,
     scanned: pairs.length,
@@ -440,14 +371,12 @@ function KstCell({ r }: { r: Row }) {
   }
   return (
     <Cell
-      title={`No KST cross in the last ${KST_CROSS_BARS} candles — counts when KST sits on the trade's side of its signal`}
+      title={`No KST cross in the last ${KST_CROSS_BARS} candles`}
       detail={
         r.kstBarsAgo == null ? "no cross on record" : `last cross ${r.kstBarsAgo + 1} candles ago`
       }
     >
-      <Badge tone={r.criteria.kst ? sideTone(r.kstAbove) : "muted"} met={r.criteria.kst}>
-        {r.kstAbove ? "KST above signal" : "KST below signal"}
-      </Badge>
+      <Badge tone="muted">{r.kstAbove ? "KST above signal" : "KST below signal"}</Badge>
     </Cell>
   );
 }
@@ -459,11 +388,16 @@ function EmaCell({ r }: { r: Row }) {
   return (
     <Cell
       title={`EMA ${EMA_FAST} ${r.ema50.toPrecision(6)} vs EMA ${EMA_SLOW} ${r.ema200.toPrecision(6)}`}
-      detail={`EMA ${EMA_FAST} ${bull ? ">" : "<"} EMA ${EMA_SLOW}`}
+      detail={`EMA ${EMA_FAST} ${bull ? ">" : "<"} EMA ${EMA_SLOW} · price ${r.closedPrice > r.ema200 ? "above" : "below"} EMA ${EMA_SLOW}`}
     >
       <Badge tone={sideTone(bull)} met={r.criteria.ema}>
         {bull ? "↑ Bullish stack" : "↓ Bearish stack"}
       </Badge>
+      {!r.priceWithStack && (
+        <Badge tone="warn">
+          Price {bull ? "below" : "above"} EMA {EMA_SLOW}
+        </Badge>
+      )}
       {freshCross && (
         <Badge tone="warn">
           {r.emaCrossSide === "LONG" ? "Golden cross" : "Death cross"} ·{" "}
@@ -518,22 +452,6 @@ const CRITERION_CELL: Record<Criterion, (props: { r: Row }) => React.ReactNode> 
   near: NearCell,
 };
 
-/** The 15m gate: EMA 8/12/21 ribbon and KST, both with the row's side. */
-function TriggerCell({ r }: { r: Row }) {
-  const long = r.trigger.side === "LONG";
-  const [a, b, c] = TRIGGER_EMAS;
-  return (
-    <Cell
-      title={`${TRIGGER_INTERVAL_LABEL}: EMA ${a} ${r.trigger.emas[0].toPrecision(6)} / ${b} ${r.trigger.emas[1].toPrecision(6)} / ${c} ${r.trigger.emas[2].toPrecision(6)}`}
-      detail={`EMA ${a}${long ? ">" : "<"}${b}${long ? ">" : "<"}${c} · KST ${long ? "above" : "below"}`}
-    >
-      <Badge tone={sideTone(long)} met>
-        {long ? "↑ 15M aligned" : "↓ 15M aligned"}
-      </Badge>
-    </Cell>
-  );
-}
-
 const ago = (barsAgo: number) => (barsAgo === 0 ? "last 1H candle" : `${barsAgo + 1}h ago`);
 
 /** 1H compression and CEB-X — context only, never a gate. */
@@ -583,21 +501,6 @@ function ConflictCell({ r }: { r: Row }) {
   const word = (bull: boolean) => (bull ? "bullish" : "bearish");
   return (
     <span className="inline-flex flex-col gap-1.5">
-      {r.tfConflict && (
-        <Cell
-          title={`${TRIGGER_INTERVAL_LABEL} EMA ${TRIGGER_EMAS.join("/")} and KST aligned ${r.side === "LONG" ? "long" : "short"}, but ${INTERVAL_LABEL} isn't with it`}
-          detail={[
-            r.tfConflict.ema && `${INTERVAL_LABEL} EMA ${EMA_FAST}/${EMA_SLOW} ${word(r.ema50 >= r.ema200)}`,
-            r.tfConflict.kst && `${INTERVAL_LABEL} KST ${word(r.kstAbove)}`,
-          ]
-            .filter(Boolean)
-            .join(" · ")}
-        >
-          <Badge tone="warn">
-            {TRIGGER_INTERVAL_LABEL} {word(r.side === "LONG")} vs {INTERVAL_LABEL}
-          </Badge>
-        </Cell>
-      )}
       {r.conflict.kstVsEma && r.kstCrossSide && r.kstBarsAgo != null && (
         <Cell
           title="Fresh KST cross against the EMA 50/200 stack"
@@ -624,7 +527,7 @@ function ConflictCell({ r }: { r: Row }) {
 }
 
 const HEADER: Record<Criterion, string> = {
-  kst: "KST (1H)",
+  kst: "KST cross",
   ema: "EMA trend",
   rsi: "RSI",
   near: "Price vs EMA",
@@ -648,7 +551,7 @@ function SetupTable({
   showScore: boolean;
 }) {
   const longs = rows.filter((r) => r.side === "LONG").length;
-  const columns = 11 + (showScore ? 1 : 0);
+  const columns = 10 + (showScore ? 1 : 0);
   return (
     <div className="bg-gray-900 rounded-3xl shadow-2xl p-8">
       <div className="mb-6 flex flex-wrap items-baseline gap-x-4 gap-y-2">
@@ -670,7 +573,6 @@ function SetupTable({
               <TH>#</TH>
               <TH>Pair</TH>
               <TH>Side</TH>
-              <TH>{TRIGGER_INTERVAL_LABEL} gate</TH>
               {showScore && <TH>Conflict</TH>}
               {CRITERIA.map((c) => (
                 <TH key={c}>{HEADER[c]}</TH>
@@ -691,9 +593,6 @@ function SetupTable({
                 <td className="py-4 font-semibold">{r.symbol}</td>
                 <td className="py-4">
                   <SidePill side={r.side} />
-                </td>
-                <td className="py-4">
-                  <TriggerCell r={r} />
                 </td>
                 {showScore && (
                   <td className="py-4">
@@ -785,17 +684,15 @@ export default async function TrendPullbackScanner() {
               Binance Futures {INTERVAL_LABEL} Trend Pullback Scanner
             </h1>
             <p className="text-gray-400">
-              {TRIGGER_INTERVAL_LABEL} EMA {TRIGGER_EMAS.join("/")} + KST
-              aligned • {INTERVAL_LABEL} KST aligned or just crossed • EMA{" "}
-              {EMA_FAST}/{EMA_SLOW} aligned • RSI neutral • price near an EMA •
-              liquid and moving coins only
+              Recent KST cross • EMA {EMA_FAST}/{EMA_SLOW} aligned • RSI
+              neutral • price near an EMA • liquid and moving coins only
             </p>
             <p className="mt-2 text-sm text-gray-500">
-              Every reading is on the last closed candle • re-scanned at each{" "}
-              {TRIGGER_INTERVAL_LABEL} close
+              Every reading is on the last closed {INTERVAL_LABEL} candle •
+              re-scanned at each close
             </p>
             <AutoRefresh
-              candleMs={TRIGGER_CANDLE_MS}
+              candleMs={CANDLE_MS}
               graceMs={CANDLE_CACHE_GRACE_MS}
               scannedAt={result.scannedAt}
             />
@@ -817,32 +714,29 @@ export default async function TrendPullbackScanner() {
           badgeClass="bg-emerald-500/20 text-emerald-300"
           rows={result.full}
           total={result.fullTotal}
-          subtitle={`${TRIGGER_INTERVAL_LABEL} aligned + ${INTERVAL_LABEL} KST + EMA trend + RSI neutral + near EMA • most tradable first`}
+          subtitle="KST cross + EMA trend + RSI neutral + near EMA • most tradable first"
           empty="No coin meets all four criteria on this close"
           showScore={false}
         />
 
         <SetupTable
-          title="👀 Partial — KST vs EMA, 15M vs 1H"
+          title="👀 Partial — KST vs EMA"
           badgeClass="bg-amber-500/20 text-amber-300"
           rows={result.partial}
           total={result.partialTotal}
-          subtitle={`1H: fresh KST cross against the EMA stack, or EMA ${EMA_FAST}/${EMA_SLOW} cross in the last ${EMA_CROSS_BARS} candles with KST the other way (side = the fresh signal, ${TRIGGER_INTERVAL_LABEL} agreeing) • or ${TRIGGER_INTERVAL_LABEL} EMA ${TRIGGER_EMAS.join("/")} + KST aligned while ${INTERVAL_LABEL} EMA ${EMA_FAST}/${EMA_SLOW} or KST is not (side = ${TRIGGER_INTERVAL_LABEL})`}
-          empty="No KST / EMA or 15M / 1H disagreements on this close"
+          subtitle={`Fresh KST cross against the EMA stack, or EMA ${EMA_FAST}/${EMA_SLOW} cross in the last ${EMA_CROSS_BARS} candles with KST the other way • side = the fresh signal`}
+          empty="No KST / EMA disagreements on this close"
           showScore
         />
 
         <p className="text-center text-xs text-gray-500">
-          {TRIGGER_INTERVAL_LABEL} gate: EMA {TRIGGER_EMAS.join(" > ")} and KST
-          above its signal (long), mirrored for short, on the row&apos;s side —{" "}
-          {result.gatedOut} {INTERVAL_LABEL} candidates dropped this close •{" "}
-          {INTERVAL_LABEL} KST({KST_ROC.join(" ")} / {KST_SMA.join(" ")} /{" "}
-          {KST_SIGNAL}) on the trade&apos;s side of its signal, badge shows a
-          cross within {KST_CROSS_BARS} candles • 1H context: compression (ADX
+          KST({KST_ROC.join(" ")} / {KST_SMA.join(" ")} / {KST_SIGNAL}) crossed
+          its signal within the last {KST_CROSS_BARS} closed candles and that
+          is still the latest cross • 1H context: compression (ADX
           &lt; 20, BB width in bottom 20%, RSI 40–60; loaded after{" "}
           {COMP_MIN_BARS} bars) and CEB-X breakouts / fakeouts from the last{" "}
-          {CEB_RECENT_BARS} closed hours • EMA {EMA_FAST} above (long) / below
-          (short) EMA {EMA_SLOW} • RSI({RSI_LENGTH}) {RSI_NEUTRAL_LO}–
+          {CEB_RECENT_BARS} closed hours • EMA {EMA_FAST} and the close above (long) /
+          below (short) EMA {EMA_SLOW} • RSI({RSI_LENGTH}) {RSI_NEUTRAL_LO}–
           {RSI_NEUTRAL_HI} • close within {NEAR_ATR} ATR({ATR_LENGTH}) of EMA{" "}
           {EMA_FAST} or {EMA_SLOW} • Side = recent KST cross, else EMA stack •
           Filter: 24h volume ≥ ${(SCAN_MIN_VOLUME / 1_000_000).toFixed(0)}M and

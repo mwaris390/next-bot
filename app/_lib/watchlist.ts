@@ -3,11 +3,13 @@
 //
 // Four criteria, all read off the last closed candle:
 //
-//   KST       — KST on the trade's side of its signal: aligned, or just
-//               crossed (within KST_CROSS_BARS closed candles). Up = long,
+//   KST CROSS — KST crossed its signal within the last KST_CROSS_BARS closed
+//               candles, and that is still the latest cross. Up = long,
 //               down = short.
-//   EMA TREND — EMA 50 above EMA 200 (long) / below it (short): the trend the
-//               trade leans on.
+//   EMA TREND — EMA 50 above EMA 200 AND the close above EMA 200 (long), the
+//               mirror for short: the trend the trade leans on. A bullish
+//               stack with price already under EMA 200 is a trend breaking
+//               down, not an uptrend (and vice versa), so it doesn't count.
 //   RSI       — RSI sits in the neutral band: room to run, not yet stretched.
 //   NEAR EMA  — the close is within NEAR_ATR × ATR of EMA 50 or EMA 200, so
 //               the entry is on the line, not after the move.
@@ -18,10 +20,8 @@
 // a fresh KST cross against the EMA stack, or a fresh EMA 50/200 cross with
 // KST on the other side of its signal (see `conflict`).
 //
-// 15M GATE: a 1h row is only shown when the 15m chart agrees with its side —
-// EMA 8 > 12 > 21 and KST above its signal for a long, the mirror for a short
-// (see `evaluateTrigger`). The 1h compression and CEB-X read (./hourly-context)
-// ride along as badges.
+// The 1h compression and CEB-X read (./hourly-context, ported from
+// EMA+KST+RSI.pine) ride along as badges — context only, never a gate.
 //
 // Volume and volatility are filters here, not ranking hints: a coin has to be
 // liquid and actually moving (against the scan's own median ATR%) to be shown
@@ -49,12 +49,6 @@ import {
 export const INTERVAL = "1h";
 export const CANDLE_MS = 60 * 60_000;
 export const INTERVAL_LABEL = "1H";
-
-/** The 15m gate's timeframe and EMA ribbon. */
-export const TRIGGER_INTERVAL = "15m";
-export const TRIGGER_CANDLE_MS = 15 * 60_000;
-export const TRIGGER_INTERVAL_LABEL = "15M";
-export const TRIGGER_EMAS = [8, 12, 21] as const;
 
 export const EMA_FAST = 50;
 export const EMA_SLOW = 200;
@@ -120,6 +114,8 @@ export interface Reading {
    *  emaVsKst — fresh EMA 50/200 cross, but KST sits on the other side of its signal
    */
   conflict: { kstVsEma: boolean; emaVsKst: boolean };
+  /** Close is on the EMA stack's side of EMA 200 (above for bullish, below for bearish). */
+  priceWithStack: boolean;
   kst: number;
   kstSignal: number;
   rsi: number;
@@ -198,6 +194,9 @@ export function evaluate(klines: any[]): Reading | null {
     cross.barsSince != null && cross.barsSince < KST_CROSS_BARS;
 
   const emaSide: Side = ema50 >= ema200 ? "LONG" : "SHORT";
+  /** The close sits on the stack's side of EMA 200. */
+  const priceWithStack =
+    emaSide === "LONG" ? closedPrice > ema200 : closedPrice < ema200;
   const kstAbove = kst[last] > signal[last];
 
   const emaCross = barsSinceCross(ema50All, ema200All, last);
@@ -215,8 +214,8 @@ export function evaluate(klines: any[]): Reading | null {
   return {
     side,
     criteria: {
-      kst: kstAbove === (side === "LONG"),
-      ema: emaSide === side,
+      kst: recentCross && kstCrossSide === side,
+      ema: emaSide === side && priceWithStack,
       rsi: rsi >= RSI_NEUTRAL_LO && rsi <= RSI_NEUTRAL_HI,
       near: Math.abs(touches[0].distanceAtr) <= NEAR_ATR,
     },
@@ -232,6 +231,7 @@ export function evaluate(klines: any[]): Reading | null {
         emaCrossSide != null &&
         (emaCrossSide === "LONG") !== kstAbove,
     },
+    priceWithStack,
     kst: kst[last],
     kstSignal: signal[last],
     rsi,
@@ -267,32 +267,4 @@ export function hourlyContext(klines: any[]): HourlyContext {
     compression: compression(highs, lows, closes),
     ceb: cebX(highs, lows, closes),
   };
-}
-
-// ─────────────────────────── 15M GATE ───────────────────────────
-
-export interface Trigger {
-  /** LONG when EMA 8 > 12 > 21 and KST > signal, SHORT for the mirror, else null. */
-  side: Side | null;
-  emas: number[];
-  kstAbove: boolean;
-}
-
-/** Reads the last closed 15m candle of a FULL kline series. */
-export function evaluateTrigger(klines: any[]): Trigger | null {
-  const closes = klines.slice(0, -1).map((k: any) => parseFloat(k[4]));
-  const last = closes.length - 1;
-  const emas = TRIGGER_EMAS.map((length) => emaSeries(closes, length)[last]);
-  const { kst, signal } = kstSeries(closes);
-  if (![...emas, kst[last], signal[last]].every(Number.isFinite)) return null;
-
-  const kstAbove = kst[last] > signal[last];
-  const [fast, mid, slow] = emas;
-  const side: Side | null =
-    fast > mid && mid > slow && kstAbove
-      ? "LONG"
-      : fast < mid && mid < slow && !kstAbove
-        ? "SHORT"
-        : null;
-  return { side, emas, kstAbove };
 }
